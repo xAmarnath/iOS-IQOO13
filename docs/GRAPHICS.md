@@ -2,17 +2,16 @@
 
 ## The end-to-end route
 
-```text
-Guest application / graphics service
-    Metal API
-    metal2vulkan translation
-    Mesa Turnip, Darwin virtgpu transport
-    Guest graphics ABI and XNU virtio GPU driver
-        shared commands, resources and fences
-Host Gunyah monitor
-    bounded IPC to native-context GPU worker
-    drm2kgsl → stock KGSL → Adreno 830
-        completion and readback return to the guest
+```mermaid
+flowchart TB
+    A["Guest application<br/>or graphics service"] --> B["Metal API"]
+    B --> C["metal2vulkan"]
+    C --> D["Mesa Turnip<br/>Darwin virtgpu transport"]
+    D --> E["Guest graphics ABI<br/>XNU virtio GPU driver"]
+    E <-->|"Commands, resources<br/>and fences"| F["Host Gunyah monitor"]
+    F <-->|"Bounded IPC"| G["Native-context<br/>GPU worker"]
+    G <--> H["drm2kgsl"]
+    H <--> I["Stock KGSL<br/>Adreno 830"]
 ```
 
 The guest uses a virtual GPU interface backed by the phone's real Adreno hardware. Android's KGSL driver manages physical GPU access, firmware and host memory imports. This is a mediated graphics architecture.

@@ -47,12 +47,12 @@ Two vCPUs are scheduled virtual processors. They do not imply permanent exclusiv
 
 ```mermaid
 flowchart TB
-    X["XNU guest"] <-->|"shared windows / MMIO"| M["Gunyah monitor"]
-    M <-->|"bounded IPC + shared fds"| R["GPU worker"]
+    X["XNU guest"] <-->|"Shared windows<br/>MMIO"| M["Gunyah monitor"]
+    M <-->|"Bounded IPC<br/>Shared fds"| R["GPU worker"]
     R --> K["KGSL / Adreno 830"]
     M --> P["Frame publisher"] --> V["Android viewer"]
     V --> T["Touch bridge"] --> M
-    M --> D["Read-only system files + writable Data"]
+    M --> D["Read-only system files<br/>Writable Data"]
 ```
 
 The GPU worker receives the shared resources needed for rendering. VM ownership stays in the monitor: GPU worker failure must not implicitly close VM handles or release lent memory. Input and presentation have distinct authenticated endpoints.

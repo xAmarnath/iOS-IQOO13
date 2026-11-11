@@ -31,8 +31,6 @@ The stock Android kernel remains the host. I used temporary root and removable g
   </a>
 </p>
 
-<p align="center"><a href="https://github.com/xAmarnath/iOS-IQOO13/blob/main/assets/video/ipados-demo.mp4">▶ Watch the full video</a></p>
-
 ## Screenshots
 
 <table>
@@ -69,21 +67,24 @@ The About page shows the guest's virtual iPad identity. The physical host is the
 ## How it fits together
 
 ```mermaid
-flowchart LR
+flowchart TB
     A["Android host"] --> B["Gunyah VM"]
     B --> C["EDK II UEFI"] --> D["Darwin loader"]
     D --> E["XNU + APFS"] --> F["launchd"]
-    F --> G["backboardd + SpringBoard"]
-    G --> H["Shared display + touch"] --> A
+    F --> G["backboardd<br/>SpringBoard"]
+    G --> H["Shared display<br/>and touch"] --> A
 ```
 
 Gunyah runs at EL2; the Android and XNU kernels run in their own EL1 contexts. The host monitor supplies the virtual devices and manages the guest's memory. Android owns the physical panel and presents the guest through the display app.
 
 ### The graphics path
 
-```text
-Metal → metal2vulkan → Turnip → guest virtio-gpu
-      → host drm2kgsl → stock KGSL → Adreno 830
+```mermaid
+flowchart TB
+    A["Metal"] --> B["metal2vulkan"]
+    B --> C["Turnip"] --> D["Guest virtio-gpu"]
+    D --> E["Host drm2kgsl"]
+    E --> F["Stock KGSL"] --> G["Adreno 830"]
 ```
 
 I adapted the graphics stack around the phone's memory and driver interfaces: shared buffer objects, native contexts, queue priorities, bounded IPC, command submission, fences and copied IOSurface backing. The guest can submit real GPU work without owning the physical GPU directly.
