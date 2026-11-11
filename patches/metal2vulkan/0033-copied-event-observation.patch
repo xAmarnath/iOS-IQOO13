@@ -1,0 +1,103 @@
+diff --git a/crates/metal2vulkan-runtime/src/event.rs b/crates/metal2vulkan-runtime/src/event.rs
+--- a/crates/metal2vulkan-runtime/src/event.rs
++++ b/crates/metal2vulkan-runtime/src/event.rs
+@@ -39,8 +39,8 @@
+ //!   come and go with the work. A notification for a value already reached comes due at once
+ //!   (measured on Metal).
+ 
+-use super::device::{lock, Device};
+-use super::error::{vulkan, Error, RuntimeGap};
++use super::device::{Device, lock};
++use super::error::{Error, RuntimeGap, vulkan};
+ use super::event_timeline::{EventTimeline, Signal, WaitFor};
+ use super::exit_guard::{self, Call};
+ use crate::release;
+@@ -254,10 +254,19 @@
+                     // does not wait"; a failure (a lost device) leaves the value as last seen.
+                     let waited = unsafe { raw.wait_semaphores(&info, 0) };
+                     exit_guard::called(Call::WaitSemaphores);
+-                    waited.map(|()| true).or_else(|error| match error {
+-                        vk::Result::TIMEOUT => Ok(false),
+-                        error => Err(error),
+-                    })
++                    waited
++                        .map(|()| {
++                            // A Vulkan wait orders the GPU's writes to its backing, but copied
++                            // host pages are separate. Publish those writes before observing the
++                            // event, even when this read runs ahead of the completion thread.
++                            let shared = self.device.shared();
++                            shared.copied.merge_back(&shared.counts);
++                            true
++                        })
++                        .or_else(|error| match error {
++                            vk::Result::TIMEOUT => Ok(false),
++                            error => Err(error),
++                        })
+                 };
+                 let (rose, due) = {
+                     let mut state = lock(&self.state);
+diff --git a/crates/metal2vulkan-runtime/src/tests/copied_device.rs b/crates/metal2vulkan-runtime/src/tests/copied_device.rs
+--- a/crates/metal2vulkan-runtime/src/tests/copied_device.rs
++++ b/crates/metal2vulkan-runtime/src/tests/copied_device.rs
+@@ -922,3 +922,61 @@
+     assert_eq!(gpu_bytes(&device, &buffers[7]), vec![0x68; LENGTH]);
+     assert_eq!(host.bytes(), vec![0x68; LENGTH]);
+ }
++
++// Register copied pages and signal a real Vulkan timeline independently of the completion
++// service. This deterministically models a GPU signal read before the completion turn; no
++// completion thread can perform the merge for the reader. Existing blit tests cover GPU writes.
++#[test]
++fn copied_event_read_publishes_pages_before_a_completion_turn() {
++    copied_event_observation(false);
++}
++
++#[test]
++fn copied_event_host_set_preserves_cpu_pages_without_a_gpu_signal() {
++    copied_event_observation(true);
++}
++
++fn copied_event_observation(host_set: bool) {
++    use ash::vk;
++    let host = Host::new(31);
++    let backing = Host::new(32);
++    let (device, _heard) = device_with_import(false).unwrap();
++    // SAFETY: both allocations outlive registration, and no GPU command accesses them.
++    let _copy = unsafe {
++        device
++            .shared()
++            .copied
++            .add(host.pointer, backing.pointer, LENGTH)
++    }
++    .unwrap();
++    backing.write(0, &[0xA6; LENGTH]);
++    let event = device.new_shared_event().unwrap();
++    if host_set {
++        event.set_signaled_value(7);
++        assert_eq!(event.signaled_value(), 7);
++        assert_eq!(
++            host.bytes(),
++            host.pattern(),
++            "host-set values are not GPU completion"
++        );
++        return;
++    }
++    let shared = crate::EventRef::from(&event).shared().clone();
++    shared.keep(1, 7, 0);
++    let signal = vk::SemaphoreSignalInfo::default()
++        .semaphore(shared.semaphore())
++        .value(1);
++    // SAFETY: the live device owns the semaphore; no queue submits to this isolated event.
++    unsafe { device.shared().vk().signal_semaphore(&signal) }.unwrap();
++    assert_eq!(
++        host.bytes(),
++        host.pattern(),
++        "copied pages have not been merged yet"
++    );
++    assert_eq!(event.signaled_value(), 7);
++    assert_eq!(
++        host.bytes(),
++        vec![0xA6; LENGTH],
++        "observing the event must publish copied writes"
++    );
++}

@@ -1,0 +1,47 @@
+Mount the signed owner launch cache before launchd starts.
+Preserve the sealed guest lower view and signature verification.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8182,6 +8182,8 @@
+ volatile int native_gpu_addon3_status = -1;
+ volatile int native_gpu_addon5_stage = 0;
+ volatile int native_gpu_addon5_status = -1;
++volatile int native_gpu_xpc_stage = 0;
++volatile int native_gpu_xpc_status = -1;
+ static void
+ native_gpu_addon_mount(proc_t p, user_addr_t scratch, user_addr_t offset, const char *source, size_t source_size,
+     const char *point, size_t point_size, const char *visible, const char *own, volatile int *stage, volatile int *status)
+@@ -8659,6 +8661,23 @@
+ 		return;
+ 	}
+ 	native_gpu_addon_install(p, scratch);
++	/* launchd_cache_loader reads the signed cache rather than individual plists.
++	 * The owner sidecar replaces one cached job; the detached signature and
++	 * category-2 trust entry cover every page. Keep all other xpc files visible
++	 * from the sealed lower mount. No write is made to the guest OS volume. */
++	static const char xpc_source[] = "/private/var/ngpu/xpc", xpc_point[] = "/System/Library/xpc";
++	native_gpu_addon_mount(p, scratch, 0xa00, xpc_source, sizeof(xpc_source), xpc_point, sizeof(xpc_point),
++	    "/System/Library/xpc/extensions.plist", "/System/Library/xpc/launchd.plist", &native_gpu_xpc_stage,
++	    &native_gpu_xpc_status);
++	if (native_gpu_xpc_stage == 5 && native_gpu_xpc_status == 0) {
++		vnode_t signature = NULLVP;
++		native_gpu_xpc_status = vnode_lookup("/System/Library/xpc/launchd.plist.sig", 0, &signature, vfs_context_current());
++		if (!native_gpu_xpc_status) {
++			vnode_put(signature);
++			native_gpu_xpc_stage = 6;
++		}
++	}
++	printf("droidvm-gpu: launch cache overlay stage %d status %d\n", native_gpu_xpc_stage, native_gpu_xpc_status);
+ 	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
+ 	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";
+ 	native_gpu_addon_mount(p, scratch, 0x400, extensions_source, sizeof(extensions_source), extensions_point,
+@@ -8667,7 +8686,7 @@
+ 	    &native_gpu_addon_status);
+ 	native_gpu_addon_mount(p, scratch, 0x600, daemons_source, sizeof(daemons_source), daemons_point, sizeof(daemons_point),
+ 	    "/System/Library/LaunchDaemons/com.apple.backboardd.plist",
+-	    "/System/Library/LaunchDaemons/org.blu-sharky.adrenoprobed.plist", &native_gpu_addon2_stage, &native_gpu_addon2_status);
++	    "/System/Library/LaunchDaemons/com.apple.iomfb_fdr_loader.plist", &native_gpu_addon2_stage, &native_gpu_addon2_status);
+ 	/* The default iPadOS 17 wallpaper's layered animation with PNG images in place of its HEIC ones (no hardware HEVC decoder here).
+ 	 * The overlay carries the animation's documents and the PNG images; the sealed assets directory stays visible below it. */
+ 	static const char wallpaper_source[] = "/private/var/ngpu/wallpaper",

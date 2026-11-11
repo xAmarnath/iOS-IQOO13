@@ -1,0 +1,530 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2175,6 +2175,13 @@
+         // check's own textures take it whatever the verdict, and are neither counted nor
+         // announced.
+         let class = match texels.buffer.caller_memory() {
++            // The GPU uses ordinary device memory for copied pages. A compatible linear
++            // image can share that allocation; buffer tracking still copies in and merges back.
++            Some(CallerMemory::HostPages)
++                if texels.buffer.copied() && !texels.buffer.detached() =>
++            {
++                None
++            }
+             Some(CallerMemory::HostPages) if texels.buffer.over_dma_buf() => {
+                 Some(PagesClass::DmaBuf)
+             }
+@@ -2207,16 +2214,6 @@
+                         Refusal::Detached,
+                         "the buffer's bytes were detached from their pages (detach_backing) as the \
+                          texture was made"
+-                            .to_owned(),
+-                    )
+-                } else if texels.buffer.copied() {
+-                    // A copied host buffer's bytes the GPU uses lie in memory of the device's
+-                    // own, no import of the pages (`copied.rs`): the shadow copies them, its
+-                    // copies the buffer's uses, which commits copy in and completions merge back.
+-                    ShadowCause::Refused(
+-                        Refusal::Placement,
+-                        "the buffer's bytes are a copy of the caller's pages in memory of the \
+-                         device's own, which no image over the pages lies in"
+                             .to_owned(),
+                     )
+                 } else {
+@@ -2617,7 +2614,74 @@
+         }
+     }
+ 
+-    /// The linear image of `plan` aliasing `texels` in their buffer's memory (the runtime's own),
++    /// Make an ordinary linear image only when its layout, span and memory type fit
++    /// the buffer allocation. Used for both initial aliases and copied-page rebinds.
++    fn buffer_alias_unbound(
++        &self,
++        plan: &ImagePlan,
++        layout: &crate::linear_plan::BufferLayout,
++        memory_offset: u64,
++        room: u64,
++        type_index: u32,
++        facts: &ImageFacts<'_>,
++    ) -> Result<Result<LinearMade, String>, Error> {
++        let made = if let Some(LinearLack { format, features }) = linear_lack(plan, facts) {
++            Err(LinearRefusal::Need(LinearNeed::Features { format, features }).describe(plan))
++        } else {
++            self.linear_image(plan)?
++                .map_err(|refusal| refusal.describe(plan))
++        };
++        let LinearMade {
++            raw,
++            requirements,
++            report,
++            initial,
++        } = match made {
++            Ok(made) => made,
++            Err(why) => {
++                return Ok(Err(format!(
++                    "the device makes no linear image of the texture: {why}"
++                )));
++            }
++        };
++        let raw_device = self.shared().vk();
++        let image = LinearImage {
++            alignment: requirements.alignment,
++            size: requirements.size,
++            offset: report.offset,
++            subresource: report.size,
++            row_pitch: report.row_pitch,
++            array_pitch: report.array_pitch,
++        };
++        let why = if !aliases(layout, memory_offset, room, &image) {
++            Some(format!(
++                "the device's linear image of the texture lays its texels out otherwise than \
++                 Metal at the texels' offset and row pitch, or holds other bytes than its texels \
++                 (rows {} bytes apart, a subresource of {} bytes, aligned to {})",
++                report.row_pitch, report.size, requirements.alignment
++            ))
++        } else if requirements.memory_type_bits & (1 << type_index) == 0 {
++            Some(
++                "the device's linear image of the texture takes no memory of the buffer's type"
++                    .to_owned(),
++            )
++        } else {
++            None
++        };
++        if let Some(why) = why {
++            // SAFETY: the image is live and unbound, and no command uses it.
++            unsafe { release::object(raw_device, raw) };
++            return Ok(Err(why));
++        }
++        Ok(Ok(LinearMade {
++            raw,
++            requirements,
++            report,
++            initial,
++        }))
++    }
++
++    /// The linear image of `plan` aliasing `texels` in their buffer's memory (the runtime's own, including copied host pages),
+     /// in the `GENERAL` layout and holding the buffer's bytes, where the device makes one that
+     /// lies exactly on Metal's layout there (`linear_plan::linear_lack` and `aliases`); why not
+     /// where it does not, and for a buffer over the caller's `VkBuffer`, whose memory's handle type
+@@ -2634,6 +2698,7 @@
+     ) -> Result<Aliased, Error> {
+         match texels.buffer.caller_memory() {
+             None => {}
++            Some(CallerMemory::HostPages) if texels.buffer.copied() => {}
+             Some(CallerMemory::HostPages) => {
+                 return Err(internal("an aliasing image over the caller's host pages"));
+             }
+@@ -2650,55 +2715,20 @@
+         }
+         let (memory, buffer_offset, type_index) = texels.buffer.memory();
+         let memory_offset = buffer_offset + texels.layout.offset;
+-        let made = if let Some(LinearLack { format, features }) = linear_lack(&plan, facts) {
+-            Err(LinearRefusal::Need(LinearNeed::Features { format, features }).describe(&plan))
+-        } else {
+-            self.linear_image(&plan)?
+-                .map_err(|refusal| refusal.describe(&plan))
+-        };
+-        let LinearMade {
+-            raw,
+-            requirements,
+-            report,
+-            initial,
+-        } = match made {
++        let room = texels.buffer.padded_length() - texels.layout.offset;
++        let made = self.buffer_alias_unbound(
++            &plan,
++            &texels.layout,
++            memory_offset,
++            room,
++            type_index,
++            facts,
++        )?;
++        let LinearMade { raw, initial, .. } = match made {
+             Ok(made) => made,
+-            Err(why) => {
+-                return Ok(Err(format!(
+-                    "the device makes no linear image of the texture: {why}"
+-                )));
+-            }
++            Err(why) => return Ok(Err(why)),
+         };
+         let raw_device = self.shared().vk();
+-        let room = texels.buffer.padded_length() - texels.layout.offset;
+-        let image = LinearImage {
+-            alignment: requirements.alignment,
+-            size: requirements.size,
+-            offset: report.offset,
+-            subresource: report.size,
+-            row_pitch: report.row_pitch,
+-            array_pitch: report.array_pitch,
+-        };
+-        let why = if !aliases(&texels.layout, memory_offset, room, &image) {
+-            Some(format!(
+-                "the device's linear image of the texture lays its texels out otherwise than \
+-                 Metal at the texels' offset and row pitch, or holds other bytes than its texels \
+-                 (rows {} bytes apart, a subresource of {} bytes, aligned to {})",
+-                report.row_pitch, report.size, requirements.alignment
+-            ))
+-        } else if requirements.memory_type_bits & (1 << type_index) == 0 {
+-            Some(
+-                "the device's linear image of the texture takes no memory of the buffer's type"
+-                    .to_owned(),
+-            )
+-        } else {
+-            None
+-        };
+-        if let Some(why) = why {
+-            // SAFETY: the image is live and unbound, and no command uses it.
+-            unsafe { release::object(raw_device, raw) };
+-            return Ok(Err(why));
+-        }
+         // SAFETY: the image is live and unbound; the memory is the buffer's, which outlives the
+         // texture holding it, in a type the image takes, at an offset `aliases` checked against
+         // the image's alignment and size.
+@@ -2740,9 +2770,19 @@
+             objects: ObjectsToken::default(),
+         };
+         // Leaving `PREINITIALIZED` keeps the bytes the image holds: the buffer's.
+-        let first = FirstMove::new(raw, image.plan().format, initial, None);
++        let pages = texels.buffer.host_pages();
++        let first = FirstMove::new(
++            raw,
++            image.plan().format,
++            initial,
++            pages.as_ref().and_then(pages_hold),
++        );
+         *lock(&image.first_move) = Some(first);
+-        Ok(Ok(image.shared()))
++        let image = image.shared();
++        if pages.is_some() {
++            self.watch_buffer_image(texels, &image);
++        }
++        Ok(Ok(image))
+     }
+ 
+     /// The image of a texture over dma-buf pages (over a buffer, or placed in a heap), `made` of
+diff --git a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
+--- a/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
++++ b/crates/metal2vulkan-runtime/src/texture/in_place_image.rs
+@@ -31,18 +31,18 @@
+ //!   image bound to the pages (`detach.rs`).
+ 
+ use super::{
+-    first_color_subresource, pages_hold, FirstMove, Image, ImageObjects, ImageSwap, KeptResolves,
+-    KeyMap, LinearMade, LinearRefusal, ObjectsToken, Owner, Raw, Remade, Storage, Texture,
++    FirstMove, Image, ImageObjects, ImageSwap, KeptResolves, KeyMap, LinearMade, LinearRefusal,
++    ObjectsToken, Owner, Raw, Remade, Storage, Texture, first_color_subresource, pages_hold,
+ };
+ use crate::buffer::InPlaceWatch;
+ use crate::buffer_texture::Texels;
+ use crate::device::lock;
+-use crate::error::{vulkan, Error, RuntimeGap};
++use crate::error::{Error, RuntimeGap, vulkan};
+ use crate::image_plan::{ImageFacts, ImagePlan};
+ use crate::in_place::{PagesClass, Refusal};
+-use crate::linear_plan::{check_linear_limits, linear_lack, BufferLayout, LinearLack};
++use crate::linear_plan::{BufferLayout, LinearLack, check_linear_limits, linear_lack};
+ use crate::texture_descriptor::TextureDescriptor;
+-use crate::{release, Device};
++use crate::{Device, release};
+ use ash::vk;
+ use metal2vulkan::error::LinearNeed;
+ use std::any::Any;
+@@ -106,17 +106,22 @@
+         };
+         // Over a no-copy buffer's pages, noted for a rebind.
+         if class != PagesClass::Fresh {
+-            if let Some(base) = texels.buffer.host_pages().map(|pages| pages.memory().1) {
+-                let (_, buffer_offset, _) = texels.buffer.memory();
+-                let image_any: Arc<dyn Any + Send + Sync> = image.clone();
+-                texels.buffer.watch_in_place(InPlaceWatch {
+-                    image: Arc::downgrade(&image_any),
+-                    from_base: buffer_offset + layout.offset - base,
+-                    layout,
+-                });
+-            }
++            self.watch_buffer_image(texels, &image);
+         }
+         Ok(Ok((image, pitched)))
++    }
++
++    /// Track every image bound into rebindable buffer memory, imported or copied.
++    pub(super) fn watch_buffer_image(&self, texels: &Texels, image: &Arc<Image>) {
++        if let Some(base) = texels.buffer.host_pages().map(|pages| pages.memory().1) {
++            let (_, buffer_offset, _) = texels.buffer.memory();
++            let image_any: Arc<dyn Any + Send + Sync> = image.clone();
++            texels.buffer.watch_in_place(InPlaceWatch {
++                image: Arc::downgrade(&image_any),
++                from_base: buffer_offset + texels.layout.offset - base,
++                layout: texels.layout,
++            });
++        }
+     }
+ 
+     /// [`in_place_image`](Self::in_place_image) over pages imported by their pointer: the image
+@@ -402,7 +407,7 @@
+         layout: &BufferLayout,
+         facts: &ImageFacts<'_>,
+     ) -> Result<Result<LinearMade, (Refusal, String)>, Error> {
+-        use crate::dma_buf::{memory_plane_0, ModifierMemory, DRM_FORMAT_MOD_LINEAR};
++        use crate::dma_buf::{DRM_FORMAT_MOD_LINEAR, ModifierMemory, memory_plane_0};
+         let (row_pitch, slice_pitch) = (layout.row_pitch, layout.slice_pitch);
+         let raw_device = self.shared().vk();
+         let enabled = (self.shared().host_import.as_ref())
+@@ -547,20 +552,37 @@
+                 continue;
+             }
+             let at = base + watch.from_base;
+-            let made = self.in_place_unbound(image.plan(), &watch.layout, &facts)?;
++            let room = pages.memory_room().saturating_sub(watch.from_base);
++            let made = if pages.copied() {
++                // Copied pages use ordinary Vulkan memory, not a host import. Remake an
++                // ordinary linear image, checking its complete footprint before binding.
++                self.buffer_alias_unbound(
++                    image.plan(),
++                    &watch.layout,
++                    at,
++                    room,
++                    type_index,
++                    &facts,
++                )?
++                .map(|made| (made, false))
++                .map_err(|why| (Refusal::Placement, why))
++            } else {
++                self.in_place_unbound(image.plan(), &watch.layout, &facts)?
++            };
+             let Ok((made, _)) = made else {
+                 return Err(Error::NotImplemented(RuntimeGap::RebindTextures));
+             };
+             let raw = made.raw;
+             if made.requirements.memory_type_bits & (1 << type_index) == 0
++                || made.requirements.size > room
+                 || !at.is_multiple_of(made.requirements.alignment.max(1))
+             {
+                 // SAFETY: the image is live and unbound, and no command uses it.
+                 unsafe { release::object(raw_device, raw) };
+                 return Err(Error::NotImplemented(RuntimeGap::RebindTextures));
+             }
+-            // SAFETY: the image is live and unbound, made for host allocations; the memory is the
+-            // new pages' import, in a type the image takes, at an offset that meets its alignment,
++            // SAFETY: the image is live and unbound, made for the new pages' allocation kind;
++            // their memory has the required type and room, at an aligned offset,
+             // where its texels lie as they lay in the old pages (a rebind keeps the bytes' offset
+             // in their page, and their length).
+             if let Err(error) = unsafe { crate::creation::bind_image(raw_device, raw, memory, at) }
+diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -682,6 +682,12 @@
+         let pages = self.import.pages(ReadApart::Texture);
+         let placement = &pages.memory.placement;
+         (placement.memory, placement.offset + pages.offset)
++    }
++
++    /// Bytes available from the host buffer's first byte to the end of its GPU placement.
++    pub(super) fn memory_room(&self) -> u64 {
++        let pages = self.import.pages(ReadApart::Texture);
++        pages.memory.placement.size().saturating_sub(pages.offset)
+     }
+ 
+     /// Where the bytes start in their first imported page.
+diff --git a/crates/metal2vulkan-runtime/src/buffer_descriptor.rs b/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
+--- a/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
++++ b/crates/metal2vulkan-runtime/src/buffer_descriptor.rs
+@@ -774,11 +774,8 @@
+                     shared.counts.host_import_refused_by_host();
+                 }
+                 let copy = |failed: Option<Error>| {
+-                    // An image in place over the bytes would be made again over the copy, which
+-                    // is not done: refused, as over new pages no image takes.
+-                    if !in_place.is_empty() {
+-                        return Err(Error::NotImplemented(RuntimeGap::RebindTextures));
+-                    }
++                    // Bound images are remade against this placement below. A layout or
++                    // memory-type mismatch fails before the new pages replace the old ones.
+                     // SAFETY: the caller's contract.
+                     unsafe { self.copied_pages(pointer, length, &window, failed) }
+                 };
+diff --git a/crates/metal2vulkan-runtime/src/tests/copied_device.rs b/crates/metal2vulkan-runtime/src/tests/copied_device.rs
+--- a/crates/metal2vulkan-runtime/src/tests/copied_device.rs
++++ b/crates/metal2vulkan-runtime/src/tests/copied_device.rs
+@@ -1059,3 +1059,177 @@
+     );
+     drop(copy);
+ }
++
++fn copied_alias_texture(buffer: &Buffer) -> crate::Texture {
++    let mut descriptor = crate::TextureDescriptor::texture_2d(
++        metal2vulkan::metal::PixelFormat::RGBA8Unorm,
++        64,
++        16,
++        false,
++    );
++    descriptor.usage = metal2vulkan::metal::TextureUsage::SHADER_READ
++        | metal2vulkan::metal::TextureUsage::SHADER_WRITE;
++    buffer.new_texture(&descriptor, 4096, 256).unwrap()
++}
++
++fn copied_alias_read(device: &Device, texture: &crate::Texture) -> Vec<u8> {
++    let output = device.new_buffer(4096, ResourceOptions::shared()).unwrap();
++    blit(device, |encoder| {
++        encoder
++            .copy_from_texture_to_buffer(
++                texture,
++                0,
++                0,
++                crate::Origin { x: 0, y: 0, z: 0 },
++                crate::Size::new(64, 16, 1),
++                &output,
++                0,
++                256,
++                4096,
++                crate::BlitOption::None,
++            )
++            .unwrap();
++    });
++    // SAFETY: the completed GPU copy initialized these live mapped bytes.
++    unsafe { std::slice::from_raw_parts(output.contents().unwrap().as_ptr(), 4096) }.to_vec()
++}
++
++fn copied_alias_write(
++    encoder: &mut crate::BlitCommandEncoder,
++    input: &Buffer,
++    texture: &crate::Texture,
++) {
++    encoder
++        .copy_from_buffer_to_texture(
++            input,
++            0,
++            256,
++            4096,
++            crate::Size::new(64, 16, 1),
++            texture,
++            0,
++            0,
++            crate::Origin { x: 0, y: 0, z: 0 },
++            crate::BlitOption::None,
++        )
++        .unwrap();
++}
++
++#[test]
++fn copied_texture_alias_coherence_and_buffer_lifetime_without_import() {
++    let host = Host::new(50);
++    let (device, _) = device_with_import(false).unwrap();
++    let buffer = host.buffer(&device, None);
++    let texture = copied_alias_texture(&buffer);
++    assert!(
++        texture.aliases_buffer(),
++        "texture must reuse the GPU buffer allocation"
++    );
++    assert_eq!(
++        copied_alias_read(&device, &texture),
++        host.pattern()[4096..8192]
++    );
++    host.write(4113, &[0xA9; 37]);
++    assert_eq!(
++        copied_alias_read(&device, &texture),
++        host.bytes()[4096..8192]
++    );
++    drop(buffer);
++    let input = device
++        .new_buffer_with_bytes(&[0xC3; 4096], ResourceOptions::shared())
++        .unwrap();
++    blit(&device, |encoder| {
++        copied_alias_write(encoder, &input, &texture)
++    });
++    let mut expected = host.pattern();
++    expected[4096..8192].fill(0xC3);
++    assert_eq!(host.bytes(), expected, "only texture texels are written");
++    assert_eq!(copied_alias_read(&device, &texture), vec![0xC3; 4096]);
++}
++
++#[test]
++fn copied_texture_alias_rebind_import_and_detach() {
++    let first = Host::new(51);
++    let second = Host::new(52);
++    let third = Host::new(53);
++    let (device, _) = device().expect("host import required for rebind regression");
++    let asked = Arc::default();
++    let buffer = first.buffer(&device, Some(gate(&asked, false)));
++    let texture = copied_alias_texture(&buffer);
++    assert!(texture.aliases_buffer());
++    assert_eq!(
++        copied_alias_read(&device, &texture),
++        first.pattern()[4096..8192]
++    );
++    rebind(&buffer, &second, Some(gate(&asked, false))).unwrap();
++    assert!(buffer.copied());
++    assert_eq!(
++        copied_alias_read(&device, &texture),
++        second.pattern()[4096..8192]
++    );
++    rebind(&buffer, &third, None).unwrap();
++    assert!(!buffer.copied());
++    assert_eq!(
++        copied_alias_read(&device, &texture),
++        third.pattern()[4096..8192]
++    );
++    rebind(&buffer, &second, Some(gate(&asked, false))).unwrap();
++    buffer.detach_backing().unwrap();
++    rebind(&buffer, &first, Some(gate(&asked, false))).unwrap();
++    assert_eq!(
++        copied_alias_read(&device, &texture),
++        first.pattern()[4096..8192]
++    );
++    assert_eq!(second.bytes(), second.pattern());
++    assert_eq!(third.bytes(), third.pattern());
++}
++
++#[test]
++fn copied_texture_alias_rebind_before_first_use() {
++    let first = Host::new(54);
++    let second = Host::new(55);
++    let (device, _) = device().expect("host import required for rebind regression");
++    let asked = Arc::default();
++    let buffer = first.buffer(&device, Some(gate(&asked, false)));
++    let texture = copied_alias_texture(&buffer);
++    assert!(texture.aliases_buffer());
++    rebind(&buffer, &second, Some(gate(&asked, false))).unwrap();
++    assert_eq!(
++        copied_alias_read(&device, &texture),
++        second.pattern()[4096..8192]
++    );
++    assert_eq!(first.bytes(), first.pattern());
++}
++
++#[test]
++#[cfg(target_os = "linux")]
++fn copied_texture_alias_readonly_preserves_completion_failure() {
++    let host = Host::new(56);
++    let (device, _) = device_with_import(false).unwrap();
++    let buffer = host.buffer(&device, None);
++    let texture = copied_alias_texture(&buffer);
++    assert!(texture.aliases_buffer());
++    device.shared().copied.set_read_only_for_test(host.pointer);
++    assert_eq!(
++        copied_alias_read(&device, &texture),
++        host.pattern()[4096..8192]
++    );
++    let input = device
++        .new_buffer_with_bytes(&[0xC3; 4096], ResourceOptions::shared())
++        .unwrap();
++    let queue = device.new_command_queue().unwrap();
++    let cb = queue.command_buffer().unwrap();
++    let mut encoder = cb.blit_command_encoder().unwrap();
++    copied_alias_write(&mut encoder, &input, &texture);
++    encoder.end_encoding().unwrap();
++    cb.commit().unwrap();
++    cb.wait_until_completed_for(WAIT).unwrap();
++    assert_eq!(cb.status(), CommandBufferStatus::Error);
++    assert_eq!(
++        cb.error(),
++        Some(crate::CommandBufferError::Internal(crate::VkResultCode(
++            ash::vk::Result::ERROR_VALIDATION_FAILED_EXT.as_raw()
++        )))
++    );
++    assert_eq!(host.bytes(), host.pattern());
++}

@@ -1,0 +1,193 @@
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/objects.rs b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+--- a/crates/metal2vulkan-runtime/src/pipeline/objects.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/objects.rs
+@@ -497,6 +497,10 @@
+             stages: self.stages.clone(),
+             samplers: Arc::clone(&self.samplers),
+             layout: Arc::clone(&self.layout),
++            set_needs: self.set_needs.clone(),
++            push_set_zero: self.push_set_zero,
++            dynamic: self.dynamic.clone(),
++            set_zero_shape: self.set_zero_shape,
+             content: self.content,
+             words: Arc::clone(&self.words),
+         };
+@@ -678,9 +682,6 @@
+         pipeline: CompiledPipeline<'_>,
+         digests: Option<&[Hash256]>,
+     ) -> Result<(VariantObjects, Vec<(Place, RawPipeline)>), Error> {
+-        let push_set_zero = pushes_set_zero(device, layout, stages, pipeline);
+-        let dynamic = dynamic_bindings(device, layout, push_set_zero);
+-        let set_needs = needs_of(device, layout, push_set_zero, &dynamic)?;
+         let shared = device.shared();
+         let back = lock(&shared.kept).take(shared, compiled);
+         // The kept variants' queue applied (an evicted instance's modules let go): the device's
+@@ -699,6 +700,7 @@
+         };
+         device.shared().counts.variant_taken_back();
+         let instance = back.instance;
++        let push_set_zero = back.objects.push_set_zero;
+         let immutable_pushes = match push_set_zero {
+             true => immutable_pushes(layout, &back.objects.samplers.samplers)?,
+             false => Vec::new(),
+@@ -708,10 +710,10 @@
+             stages: back.objects.stages,
+             samplers: back.objects.samplers,
+             layout: back.objects.layout,
+-            set_needs,
++            set_needs: back.objects.set_needs,
+             push_set_zero,
+-            set_zero_shape: set_zero_shape(layout, push_set_zero, &dynamic),
+-            dynamic,
++            set_zero_shape: back.objects.set_zero_shape,
++            dynamic: back.objects.dynamic,
+             immutable_pushes,
+             specialized: stages
+                 .iter()
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/kept.rs b/crates/metal2vulkan-runtime/src/pipeline/kept.rs
+--- a/crates/metal2vulkan-runtime/src/pipeline/kept.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/kept.rs
+@@ -35,6 +35,7 @@
+ use super::objects::{SamplerSet, StageObject};
+ use super::shared_layouts::SharedLayout;
+ use super::RegionKey;
++use crate::descriptor_arena::SetNeeds;
+ use crate::device::DeviceShared;
+ use crate::release;
+ use ash::vk;
+@@ -167,6 +168,12 @@
+     pub(crate) samplers: Arc<SamplerSet>,
+     /// Its set layouts and pipeline layout, a share of the device's (`shared_layouts.rs`).
+     pub(crate) layout: Arc<SharedLayout>,
++    /// Descriptor policy of this exact Vulkan layout. A later driver self-check may change
++    /// choices for new layouts, but cannot change the types in an existing one.
++    pub(crate) set_needs: Vec<SetNeeds>,
++    pub(crate) push_set_zero: bool,
++    pub(crate) dynamic: Vec<u32>,
++    pub(crate) set_zero_shape: u64,
+     /// The digest the variant's makings' records are named by (`objects::variant_content`).
+     pub(crate) content: metal2vulkan::cache::Hash256,
+     /// Each stage's words' digest (`objects::words_digest`), in stage order.
+diff --git a/crates/metal2vulkan-runtime/src/tests/dynamic_multi_variable.rs b/crates/metal2vulkan-runtime/src/tests/dynamic_multi_variable.rs
+--- a/crates/metal2vulkan-runtime/src/tests/dynamic_multi_variable.rs
++++ b/crates/metal2vulkan-runtime/src/tests/dynamic_multi_variable.rs
+@@ -460,3 +460,119 @@
+         );
+     }
+ }
++
++/// A variant made in a host step keeps its descriptor types when a later program call
++/// takes its Vulkan layout back, even after the driver's dynamic-buffer check succeeds.
++#[test]
++fn a_kept_host_step_layout_keeps_its_descriptor_policy() {
++    let scratch = Scratch::new();
++    let device = device(&scratch.0, Pushing::Withheld);
++    let ll = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("../metal2vulkan-validation/fixtures/public")
++        .join(NARROW.file);
++    let bitcode = metal2vulkan_devtools::llvm_assemble(&ll).unwrap();
++    let library = metal2vulkan::library::Library::from_air(&bitcode).unwrap();
++    let function = device
++        .new_library_with_compile_library(library)
++        .new_function_with_name(NARROW.entry)
++        .unwrap();
++    let descriptor =
++        ComputePipelineDescriptor::new(StageSource::Function(function.function_descriptor()));
++    let state = crate::exit_guard::host_step(|| {
++        device
++            .new_compute_pipeline_state(&descriptor, &PipelineOptions::default())
++            .unwrap()
++    });
++    let original = state.set_zero_choice();
++    assert!(!original.pushes);
++    assert!(!original.several_variables.is_empty());
++    assert!(original
++        .several_variables
++        .iter()
++        .all(|b| !original.dynamic.contains(b)));
++    assert!(device.shared().dynamic_multi_variable.get().is_none());
++    drop(state);
++    let answer = crate::pipeline::objects::asks_multi_variable_dynamic(&device);
++    // The CPU ICD lane must exercise the policy change; devices refusing it still exercise reuse.
++    if cfg!(m2v_cpu_icd) {
++        assert!(answer, "CPU ICD must accept multi-variable dynamic buffers");
++    }
++    let before = device.work_counts().variants_taken_back;
++    let state = device
++        .new_compute_pipeline_state(&descriptor, &PipelineOptions::default())
++        .unwrap();
++    assert_eq!(
++        device.work_counts().variants_taken_back,
++        before + 1,
++        "the real retained variant must be reused"
++    );
++    let reclaimed = state.set_zero_choice();
++    assert_eq!(
++        reclaimed.dynamic, original.dynamic,
++        "descriptor writes must retain the Vulkan layout's original binding types"
++    );
++    assert_eq!(reclaimed.pushes, original.pushes);
++
++    // Exercise allocation, descriptor writes, dynamic offsets and GPU execution after reuse.
++    let buffers: Vec<_> = (0..NARROW.slots)
++        .map(|_| {
++            device
++                .new_buffer(NARROW.bytes + MOVED, ResourceOptions::shared())
++                .unwrap()
++        })
++        .collect();
++    let queue = device.new_command_queue().unwrap();
++    let command = queue.command_buffer().unwrap();
++    let mut encoder = command.compute_command_encoder().unwrap();
++    encoder.set_compute_pipeline_state(&state).unwrap();
++    for (slot, buffer) in buffers.iter().enumerate() {
++        encoder
++            .set_buffer(Some(buffer), MOVED, slot as u32)
++            .unwrap();
++    }
++    encoder
++        .dispatch_threads(
++            Size::new(NARROW.threads, 1, 1),
++            Size::new(NARROW.threads, 1, 1),
++        )
++        .unwrap();
++    encoder.end_encoding().unwrap();
++    command.commit().unwrap();
++    command
++        .wait_until_completed_for(std::time::Duration::from_secs(60))
++        .unwrap();
++    assert!(command.error().is_none(), "{:?}", command.error());
++    let contents = buffers
++        .iter()
++        .map(|buffer| {
++            let p = buffer.contents().unwrap();
++            // SAFETY: completed shared buffers, with each allocation's actual length.
++            unsafe { std::slice::from_raw_parts(p.as_ptr(), (NARROW.bytes + MOVED) as usize) }
++                .to_vec()
++        })
++        .collect();
++    let ran = Ran {
++        buffers: contents,
++        moved: true,
++        chose: reclaimed,
++        reused: 0,
++        found: 0,
++        pushed: 0,
++    };
++    // Only the second region was dispatched; the untouched first region stays zero.
++    assert!(ran
++        .buffers
++        .iter()
++        .all(|b| b[..MOVED as usize].iter().all(|&byte| byte == 0)));
++    let shifted = Ran {
++        buffers: ran
++            .buffers
++            .iter()
++            .map(|b| b[MOVED as usize..].to_vec())
++            .collect(),
++        moved: false,
++        ..ran
++    };
++    holds_metals_values(&shifted, NARROW.threads, 1);
++    eprintln!("KEPT_DESCRIPTOR_POLICY reused=1 capability={answer} dispatched=1 values=correct");
++}

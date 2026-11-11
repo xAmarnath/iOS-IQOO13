@@ -1,0 +1,118 @@
+--- a/NativeVirtioBlock.cpp
++++ b/NativeVirtioBlock.cpp
+@@ -74,6 +74,17 @@
+ class NativeVirtioBlock : public IOBlockStorageDevice {
+   OSDeclareDefaultStructors(NativeVirtioBlock)
+   IOMemoryMap *mapping = nullptr;
++  // Optional dedicated, coherent guest DMA window, reserved outside private RAM.
++  IOMemoryMap *sharedMapping = nullptr;
++  unsigned char *sharedBytes = nullptr;
++  uint64_t sharedPhysical = 0;
++  bool configureSharedMemory(IOService *);
++  void *queueBytes() const {
++    return sharedBytes ? sharedBytes : queueMemory->getBytesNoCopy();
++  }
++  void *transferBytes() const {
++    return sharedBytes ? sharedBytes + 4096 : transferMemory->getBytesNoCopy();
++  }
+   IOBufferMemoryDescriptor *queueMemory = nullptr;
+   IOBufferMemoryDescriptor *transferMemory = nullptr;
+   IOLock *gate = nullptr;
+@@ -95,7 +106,7 @@
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+     return verifiedSnapshot;
+ #else
+-    return transferMemory->getBytesNoCopy();
++    return transferBytes();
+ #endif
+   }
+   bool online = false;
+@@ -165,6 +176,28 @@
+     IODelay(1);
+   }
+   return true;
++}
++
++bool NativeVirtioBlock::configureSharedMemory(IOService *provider)
++{
++  const OSObject *property = provider->getProperty("droidvm,shared-dma");
++  if (!property) return true;
++  const OSData *window = OSDynamicCast(OSData, property);
++  if (!window || window->getLength() != 16) return false;
++  uint64_t range[2];
++  memcpy(range, window->getBytesNoCopy(), sizeof(range));
++  // This adapter's ABI uses one 4 KiB queue and one 64 KiB transfer buffer.
++  // The tree generator gives each device its own non-overlapping window.
++  if (!range[0] || (range[0] & 4095) || range[1] != 4096 + transferSize ||
++      range[0] > UINT64_MAX - range[1]) return false;
++  IODeviceMemory *memory = IODeviceMemory::withRange(range[0], range[1]);
++  if (!memory) return false;
++  sharedMapping = memory->map(kIOMapAnywhere | kIOMapCopybackCache);
++  memory->release();
++  if (!sharedMapping || sharedMapping->getLength() < range[1]) return false;
++  sharedBytes = reinterpret_cast<unsigned char *>(sharedMapping->getVirtualAddress());
++  sharedPhysical = range[0];
++  return sharedBytes != nullptr;
+ }
+ 
+ bool NativeVirtioBlock::configureQueue()
+@@ -186,6 +219,10 @@
+   if (!(read32(0x70) & 8)) return false;
+   write32(0x30, 0);
+   if (read32(0x44) || read32(0x34) < queueSize) return false;
++  if (sharedBytes) {
++    queuePhysical = sharedPhysical;
++    transferPhysical = sharedPhysical + 4096;
++  } else {
+   queueMemory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+     static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous), 4096, 4096);
+   transferMemory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+@@ -195,9 +232,10 @@
+   queuePhysical = queueMemory->getPhysicalSegment(0, &queueLength);
+   transferPhysical = transferMemory->getPhysicalSegment(0, &transferLength);
+   if (!queuePhysical || !transferPhysical || queueLength < 4096 || transferLength < transferSize) return false;
+-  bzero(queueMemory->getBytesNoCopy(), 4096);
++  }
++  bzero(queueBytes(), 4096);
+   // Suppress used-buffer interrupts: this bounded initial transport polls.
+-  *reinterpret_cast<volatile uint16_t *>(static_cast<unsigned char *>(queueMemory->getBytesNoCopy()) + 128) = 1;
++  *reinterpret_cast<volatile uint16_t *>(static_cast<unsigned char *>(queueBytes()) + 128) = 1;
+   availableIndex = usedIndex = 0;
+   dmaBarrier();
+   write32(0x38, queueSize);
+@@ -428,7 +466,7 @@
+   IOReturn status = readRawSectors(alignedBegin / 512, span);
+   if (status) return status;
+   // Snapshot completed DMA before hashing; only this CPU-owned copy is exposed.
+-  memcpy(verifiedSnapshot, transferMemory->getBytesNoCopy(), span);
++  memcpy(verifiedSnapshot, transferBytes(), span);
+ #if defined(NATIVE_VERIFIED_BLOCK_INJECT_FAULT) && NATIVE_VERIFIED_BLOCK_INJECT_FAULT
+   verifiedSnapshot[0] ^= 1; // Isolated negative input, original disk/signature untouched.
+ #endif
+@@ -452,7 +490,7 @@
+ {
+   if (!online || !bytes || bytes > transferSize || (bytes & 511) ||
+       sector >= capacity || bytes / 512 > capacity - sector) return kIOReturnBadArgument;
+-  auto *queue = static_cast<unsigned char *>(queueMemory->getBytesNoCopy());
++  auto *queue = static_cast<unsigned char *>(queueBytes());
+   auto *descriptors = reinterpret_cast<Descriptor *>(queue);
+   auto *request = reinterpret_cast<Request *>(queue + 512);
+   volatile uint8_t *status = queue + 528;
+@@ -506,7 +544,7 @@
+   if (read32(0x00) != 0x74726976 || read32(0x04) != 2 || read32(0x08) != 2) return false;
+   ownsDevice = true;
+   gate = IOLockAlloc();
+-  if (!gate || !configureQueue()) return false;
++  if (!gate || !configureSharedMemory(provider) || !configureQueue()) return false;
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+   if (!configureVerification()) return false;
+ #endif
+@@ -570,6 +608,8 @@
+ #endif
+   if (queueMemory) { queueMemory->release(); queueMemory = nullptr; }
+   if (transferMemory) { transferMemory->release(); transferMemory = nullptr; }
++  if (sharedMapping) { sharedMapping->release(); sharedMapping = nullptr; }
++  sharedBytes = nullptr;
+   if (mapping) { mapping->release(); mapping = nullptr; }
+   if (gate) { IOLockFree(gate); gate = nullptr; }
+   IOBlockStorageDevice::free();

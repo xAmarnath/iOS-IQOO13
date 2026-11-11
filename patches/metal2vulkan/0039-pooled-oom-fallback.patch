@@ -1,0 +1,142 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -2392,7 +2392,8 @@
+     let mut failure = Error::OutOfMemory(MemoryKind::Device);
+     for type_index in candidates {
+         let pool = (holds, type_index);
+-        let block_size = match dedicated {
++        let mut dedicated = dedicated;
++        let mut block_size = match dedicated {
+             true => size,
+             false => lock(memory).next_block_bytes(pool, size),
+         };
+@@ -2417,12 +2418,22 @@
+             }
+         }
+         // Retry OOM after releasing unused blocks competing for this heap.
+-        let made = match maker.make(device, type_index, block_size, addressed) {
++        let mut made = match maker.make(device, type_index, block_size, addressed) {
+             Err(Error::OutOfMemory(_)) if lock(memory).release_kept(device, type_index) > 0 => {
+                 maker.make(device, type_index, block_size, addressed)
+             }
+             made => made,
+         };
++        // Pool growth is a cache policy, not the resource's memory requirement.
++        // If the preferred block still cannot fit after idle reclamation, try
++        // exactly the required bytes once. Keep it dedicated so it is released
++        // with its placement rather than retaining another undersized pool.
++        // Never shrink dedicated requests or retry non-memory driver failures.
++        if matches!(made, Err(Error::OutOfMemory(_))) && !dedicated && block_size > size {
++            block_size = size;
++            dedicated = true;
++            made = maker.make(device, type_index, block_size, addressed);
++        }
+         if let Err(error) = &made {
+             crate::failure_trace::record(format_args!(
+                 "memory block failed request={size} block={block_size} align={align} type={type_index} class={class:?} dedicated={dedicated} error={error:?}"
+diff --git a/crates/metal2vulkan-runtime/src/tests/heap_pressure.rs b/crates/metal2vulkan-runtime/src/tests/heap_pressure.rs
+--- a/crates/metal2vulkan-runtime/src/tests/heap_pressure.rs
++++ b/crates/metal2vulkan-runtime/src/tests/heap_pressure.rs
+@@ -217,3 +217,101 @@
+     assert!(request(&memory, &device, 64).is_ok());
+     lock(&memory).destroy(&device);
+ }
++
++#[test]
++fn pooled_growth_oom_falls_back_to_real_requirement_and_releases_it() {
++    let (device, memory) = fixture();
++    // Another type owns live bytes; no idle block can be reclaimed. The
++    // preferred 128-byte pool cannot fit, but the actual 32-byte buffer can.
++    let peer = seeded(&memory, &device, 1, Holds::Images, 128, false);
++    DRIVER.with(|d| {
++        let mut d = d.borrow_mut();
++        d.budget = 160;
++        d.attempts = 0;
++    });
++    let placement = place(
++        &memory,
++        &device,
++        &vk::MemoryRequirements {
++            size: 32,
++            alignment: 16,
++            memory_type_bits: 1,
++        },
++        MemoryClass::Private,
++        None,
++        Holds::Buffers,
++        Fit::Pooled,
++    )
++    .unwrap();
++    assert_eq!(placement.size, 32);
++    assert_eq!(placement.offset, 0);
++    DRIVER.with(|d| {
++        let d = d.borrow();
++        assert_eq!(d.attempts, 2);
++        assert_eq!(d.live[&placement.memory.as_raw()], (0, 32));
++        assert!(d.live.contains_key(&peer));
++    });
++    let mut m = lock(&memory);
++    assert!(
++        !m.pool_ref(Holds::Buffers, 0)
++            .pooled(placement.block.unwrap())
++    );
++    let raw = placement.memory.as_raw();
++    // Dedicated buffers have no spare image policy; freeing must not cache it.
++    m.free(&device, &placement);
++    DRIVER.with(|d| assert!(!d.borrow().live.contains_key(&raw)));
++}
++
++#[test]
++fn pooled_exact_fallback_still_reports_real_exhaustion() {
++    let (device, memory) = fixture();
++    seeded(&memory, &device, 1, Holds::Images, 128, false);
++    DRIVER.with(|d| {
++        let mut d = d.borrow_mut();
++        d.budget = 159;
++        d.attempts = 0;
++    });
++    let result = place(
++        &memory,
++        &device,
++        &vk::MemoryRequirements {
++            size: 32,
++            alignment: 16,
++            memory_type_bits: 1,
++        },
++        MemoryClass::Private,
++        None,
++        Holds::Buffers,
++        Fit::Pooled,
++    );
++    assert!(matches!(
++        result,
++        Err(Error::OutOfMemory(MemoryKind::Device))
++    ));
++    DRIVER.with(|d| {
++        let d = d.borrow();
++        assert_eq!(d.attempts, 2);
++        assert_eq!(d.live.len(), 1);
++    });
++}
++
++#[test]
++fn pooled_growth_does_not_retry_non_memory_driver_failure() {
++    let (device, memory) = fixture();
++    DRIVER.with(|d| d.borrow_mut().refusal = Some(vk::Result::ERROR_DEVICE_LOST));
++    let result = place(
++        &memory,
++        &device,
++        &vk::MemoryRequirements {
++            size: 32,
++            alignment: 16,
++            memory_type_bits: 1,
++        },
++        MemoryClass::Private,
++        None,
++        Holds::Buffers,
++        Fit::Pooled,
++    );
++    assert!(matches!(result, Err(Error::DeviceLost)));
++    DRIVER.with(|d| assert_eq!(d.borrow().attempts, 1));
++}

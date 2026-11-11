@@ -1,0 +1,19 @@
+Keep the thread reference when copying a referenced VFS context.
+
+The 24A446 vfs_context_create implementation retains the thread when bit 0
+of vc_thread is set.  Match that lifetime rule in the source kernel: release
+already consumes the reference.  Keep native allocation and credentials.
+
+--- a/bsd/vfs/kpi_vfs.c
++++ b/bsd/vfs/kpi_vfs.c
+@@ -1631,6 +1631,10 @@
+ 	*newcontext = *ctx;
++	if (VFS_CONTEXT_THREAD_IS_REFERENCED(newcontext)) {
++		thread_reference(VFS_CONTEXT_GET_THREAD(newcontext));
++	}
++
+ 	if (IS_VALID_CRED(ctx->vc_ucred)) {
+ 		kauth_cred_ref(ctx->vc_ucred);
+ 	}
+ 
+ 	return newcontext;

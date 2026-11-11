@@ -1,0 +1,377 @@
+diff --git a/crates/metal2vulkan-runtime/src/copied_pages.rs b/crates/metal2vulkan-runtime/src/copied_pages.rs
+--- a/crates/metal2vulkan-runtime/src/copied_pages.rs
++++ b/crates/metal2vulkan-runtime/src/copied_pages.rs
+@@ -29,11 +29,12 @@
+     base: u64,
+     length: u64,
+     pointer: NonNull<u8>,
++    writable: bool,
+ }
+ 
+ impl Pages {
+     /// Retain the VM objects containing these bytes with a shared (not copy-on-write) alias.
+-    /// The kernel validates the range; a failed/readonly mapping is never registered for sync.
++    /// The kernel validates the range; unreadable mappings are never registered for sync.
+     pub(crate) fn retain(pointer: NonNull<u8>, length: usize) -> Result<Self, NotCopied> {
+         // SAFETY: queries the current process's page size without dereferencing caller memory.
+         let page = usize::try_from(unsafe { getpagesize() })
+@@ -82,13 +83,14 @@
+             base,
+             length: size,
+             pointer,
++            writable: current & 2 != 0,
+         };
+-        // Sync reads and writes the alias. Do not elevate protections or silently drop writes.
+-        if current & 3 != 3 {
++        // Read-only inputs are valid. Keep the returned protection; never elevate it.
++        if current & 1 == 0 {
+             crate::failure_trace::record(format_args!(
+                 "copied alias protection refused source={source:#x} length={length:#x} current={current:#x} maximum={maximum:#x}"
+             ));
+-            // VM_PROT_READ | VM_PROT_WRITE
++            // VM_PROT_READ
+             return Err(NotCopied::Unreadable);
+         }
+         let address = base
+@@ -96,6 +98,10 @@
+             .ok_or(NotCopied::Unreadable)?;
+         pages.pointer = NonNull::new(address as *mut u8).ok_or(NotCopied::Unreadable)?;
+         Ok(pages)
++    }
++
++    pub(crate) fn writable(&self) -> bool {
++        self.writable
+     }
+ 
+     pub(crate) fn pointer(&self) -> NonNull<u8> {
+diff --git a/crates/metal2vulkan-runtime/src/copied.rs b/crates/metal2vulkan-runtime/src/copied.rs
+--- a/crates/metal2vulkan-runtime/src/copied.rs
++++ b/crates/metal2vulkan-runtime/src/copied.rs
+@@ -5,6 +5,9 @@
+ //! heap on a device without a host-page importer. These paths are announced
+ //! (`copied-host-pages`). On Darwin, an owned shared CPU alias retains the original pages even
+ //! when CoreAnimation unmaps/replaces the caller address; no native GPU page import is needed.
++//! Read-only Darwin aliases support GPU reads and CPU updates through other mappings.
++//! Changed GPU bytes in them are refused with a runtime validation error, never written to
++//! the protected alias. This is not Metal's write-dropping emulation: only read use is supported.
+ //!
+ //! - **The copy.** A `VkBuffer` of the buffer's length in host-visible, coherent memory of the
+ //!   runtime's own ([`MemoryClass::Shared`](crate::memory::MemoryClass)), which the GPU uses; the
+@@ -61,11 +64,15 @@
+ /// Why a copy was not made ([`CopiedBuffers::add`]).
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub(crate) enum NotCopied {
+-    /// A page is unreadable, or Darwin cannot retain a shared read/write mapping for sync.
++    /// A page is unreadable, or Darwin cannot retain a shared readable mapping for sync.
+     Unreadable,
+     /// The host has no memory for the copy's snapshot.
+     OutOfHostMemory,
+ }
++
++/// A copied input was changed by the GPU although its retained pages are read-only.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct ReadOnlyWrite;
+ 
+ /// A copy and the caller's pages it mirrors.
+ struct Entry {
+@@ -78,6 +85,9 @@
+     copy: NonNull<u8>,
+     /// The bytes the pages and the copy last agreed on.
+     snapshot: Box<[u8]>,
++    writable: bool,
++    /// Sticky until this import is dropped: another observation must not hide a failed write.
++    read_only_write: bool,
+ }
+ 
+ // SAFETY: Darwin entries own an alias of the original pages; elsewhere `HostMemory::new`
+@@ -102,7 +112,44 @@
+     }
+ }
+ 
++impl Entry {
++    fn check_read_only(&mut self) -> Result<(), ReadOnlyWrite> {
++        if self.writable {
++            return Ok(());
++        }
++        if !self.read_only_write {
++            // SAFETY: the entry owns the live mapped copy for this length under the registry lock.
++            let copy =
++                unsafe { std::slice::from_raw_parts(self.copy.as_ptr(), self.snapshot.len()) };
++            if copy != self.snapshot.as_ref() {
++                self.read_only_write = true;
++                crate::failure_trace::record(format_args!(
++                    "copied read-only input written id={} length={:#x}",
++                    self.id,
++                    self.snapshot.len()
++                ));
++            }
++        }
++        if self.read_only_write {
++            Err(ReadOnlyWrite)
++        } else {
++            Ok(())
++        }
++    }
++}
++
+ impl CopiedBuffers {
++    // Darwin protection discovery is qualified separately by the shared-mapping shim.
++    // This test hook lets a Linux Vulkan device exercise the real completion/event paths.
++    #[cfg(all(test, target_os = "linux", any(m2v_gpu, m2v_cpu_icd)))]
++    pub(crate) fn set_read_only_for_test(&self, pages: NonNull<u8>) {
++        let mut entries = lock(&self.entries);
++        let entry = entries
++            .iter_mut()
++            .find(|entry| entry.pages == pages)
++            .unwrap();
++        entry.writable = false;
++    }
+     /// Register the copy at `copy` of the `length` bytes at `pages`, its bytes read from the pages
+     /// now, through the kernel ([`read_pages`]). Refused, registering nothing, where the process
+     /// cannot read every page, or the host has no memory for the bytes the copy and the pages last
+@@ -123,6 +170,10 @@
+         let retained = super::copied_pages::Pages::retain(pages, length)?;
+         #[cfg(any(target_os = "macos", target_os = "ios"))]
+         let pages = retained.pointer();
++        #[cfg(any(target_os = "macos", target_os = "ios"))]
++        let writable = retained.writable();
++        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
++        let writable = true;
+         let mut snapshot = Vec::new();
+         if snapshot.try_reserve_exact(length).is_err() {
+             return Err(NotCopied::OutOfHostMemory);
+@@ -142,6 +193,8 @@
+             _retained: retained,
+             copy,
+             snapshot,
++            writable,
++            read_only_write: false,
+         });
+         self.live.fetch_add(1, Ordering::Relaxed);
+         Ok(Copied {
+@@ -152,31 +205,46 @@
+ 
+     /// At a commit: write into each copy the bytes the CPU changed in its pages since they last
+     /// agreed, before any of the command buffer's work is submitted.
+-    pub(crate) fn copy_in(&self, counts: &Counters) {
++    pub(crate) fn copy_in(&self, counts: &Counters) -> Result<(), ReadOnlyWrite> {
+         if self.live.load(Ordering::Relaxed) == 0 {
+-            return;
++            return Ok(());
+         }
+         let mut moved = 0u64;
++        let mut result = Ok(());
+         for entry in lock(&self.entries).iter_mut() {
+-            // SAFETY: the entry's pointers are live while it is registered (`Entry`).
++            // Check before CPU changes could overwrite evidence of an unsupported GPU write.
++            if let Err(error) = entry.check_read_only() {
++                result = Err(error);
++                continue;
++            }
++            // SAFETY: live readable pages and writable copy under the registry lock (`Entry`).
+             moved += unsafe { sync(entry.pages, entry.copy, &mut entry.snapshot, false) };
+         }
+         counts.copied_copied_in(moved);
++        result
+     }
+ 
+     /// At a batch's completion: write back into each copy's pages the bytes the GPU changed in the
+     /// copy since they last agreed, where the CPU did not change them since, before anything sees
+     /// the batch complete.
+-    pub(crate) fn merge_back(&self, counts: &Counters) {
++    pub(crate) fn merge_back(&self, counts: &Counters) -> Result<(), ReadOnlyWrite> {
+         if self.live.load(Ordering::Relaxed) == 0 {
+-            return;
++            return Ok(());
+         }
+         let mut moved = 0u64;
++        let mut result = Ok(());
+         for entry in lock(&self.entries).iter_mut() {
+-            // SAFETY: the entry's pointers are live while it is registered (`Entry`).
++            if let Err(error) = entry.check_read_only() {
++                result = Err(error);
++            }
++            if !entry.writable {
++                continue;
++            }
++            // SAFETY: live pointers and writable destination under the registry lock (`Entry`).
+             moved += unsafe { sync(entry.copy, entry.pages, &mut entry.snapshot, true) };
+         }
+         counts.copied_merged_back(moved);
++        result
+     }
+ }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2824,7 +2824,11 @@
+             }
+             // Every byte the CPU changed in a copied host buffer's pages is in its copy before any
+             // of this command buffer's work is submitted (`copied.rs`).
+-            device.shared().copied.copy_in(&device.shared().counts);
++            device
++                .shared()
++                .copied
++                .copy_in(&device.shared().counts)
++                .map_err(|_| vulkan(vk::Result::ERROR_VALIDATION_FAILED_EXT))?;
+             state.status = CommandBufferStatus::Committed;
+             // Its set-0 cache is shut here, before anything records again: from the commit on it
+             // holds what its commands took only weakly (below), so no handle a kept set holds is
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+--- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+@@ -407,7 +407,7 @@
+     // The GPU's writes into copied host buffers go back to the caller's pages before anything
+     // sees the batches complete: their event signals, the scheduler, a waiter, their completed
+     // handlers (`copied.rs`).
+-    device.shared().copied.merge_back(&device.shared().counts);
++    let copied = device.shared().copied.merge_back(&device.shared().counts);
+     // The holds of the batches that end no command buffer go first, their work completed: a
+     // detach that sees one of their signals detaches what only they held (`detach.rs`).
+     for (_, batch) in &mut finished {
+@@ -417,9 +417,11 @@
+     }
+     // Their event signals are seen before the scheduler looks again: a batch whose submission
+     // checks wait for a GPU signal to land may now go.
+-    for (_, batch) in &finished {
+-        for (event, index) in &batch.signals {
+-            event.reached(*index);
++    if copied.is_ok() {
++        for (_, batch) in &finished {
++            for (event, index) in &batch.signals {
++                event.reached(*index);
++            }
+         }
+     }
+     // A batch held at its gate, or for a GPU signal to land, may now go (`scheduler`).
+@@ -467,8 +469,18 @@
+     drop(device);
+     match settled {
+         Settled::Signaled => {
+-            for buffer in ending {
+-                CommandBufferShared::finish_here(buffer, Ok(()));
++            if copied.is_err() {
++                fail(
++                    watch,
++                    ending,
++                    CommandBufferError::Internal(crate::VkResultCode(
++                        vk::Result::ERROR_VALIDATION_FAILED_EXT.as_raw(),
++                    )),
++                );
++            } else {
++                for buffer in ending {
++                    CommandBufferShared::finish_here(buffer, Ok(()));
++                }
+             }
+         }
+         // What is pending stays pending, as Metal's does.
+diff --git a/crates/metal2vulkan-runtime/src/event.rs b/crates/metal2vulkan-runtime/src/event.rs
+--- a/crates/metal2vulkan-runtime/src/event.rs
++++ b/crates/metal2vulkan-runtime/src/event.rs
+@@ -255,13 +255,16 @@
+                     let waited = unsafe { raw.wait_semaphores(&info, 0) };
+                     exit_guard::called(Call::WaitSemaphores);
+                     waited
+-                        .map(|()| {
++                        .and_then(|()| {
+                             // A Vulkan wait orders the GPU's writes to its backing, but copied
+                             // host pages are separate. Publish those writes before observing the
+                             // event, even when this read runs ahead of the completion thread.
+                             let shared = self.device.shared();
+-                            shared.copied.merge_back(&shared.counts);
+-                            true
++                            shared
++                                .copied
++                                .merge_back(&shared.counts)
++                                .map_err(|_| vk::Result::ERROR_VALIDATION_FAILED_EXT)?;
++                            Ok(true)
+                         })
+                         .or_else(|error| match error {
+                             vk::Result::TIMEOUT => Ok(false),
+diff --git a/crates/metal2vulkan-runtime/src/tests/copied_device.rs b/crates/metal2vulkan-runtime/src/tests/copied_device.rs
+--- a/crates/metal2vulkan-runtime/src/tests/copied_device.rs
++++ b/crates/metal2vulkan-runtime/src/tests/copied_device.rs
+@@ -980,3 +980,82 @@
+         "observing the event must publish copied writes"
+     );
+ }
++
++#[test]
++#[cfg(target_os = "linux")]
++fn copied_readonly_input_is_read_by_real_gpu_work() {
++    let host = Host::new(41);
++    let (device, _heard) = device_with_import(false).unwrap();
++    let buffer = host.buffer(&device, None);
++    device.shared().copied.set_read_only_for_test(host.pointer);
++    assert_eq!(gpu_bytes(&device, &buffer), host.pattern());
++    // Models updates made through another writable mapping of the retained VM object.
++    host.write(17, &[0xA8; 37]);
++    assert_eq!(gpu_bytes(&device, &buffer), host.bytes());
++}
++
++#[test]
++#[cfg(target_os = "linux")]
++fn copied_readonly_real_gpu_write_fails_completion_without_publishing_pages() {
++    let host = Host::new(42);
++    let (device, _heard) = device_with_import(false).unwrap();
++    let buffer = host.buffer(&device, None);
++    device.shared().copied.set_read_only_for_test(host.pointer);
++    let queue = device.new_command_queue().unwrap();
++    let cb = queue.command_buffer().unwrap();
++    let mut encoder = cb.blit_command_encoder().unwrap();
++    encoder
++        .fill_buffer(&buffer, 0..LENGTH as u64, 0x55)
++        .unwrap();
++    encoder.end_encoding().unwrap();
++    cb.commit().unwrap();
++    let expected = crate::CommandBufferError::Internal(crate::VkResultCode(
++        ash::vk::Result::ERROR_VALIDATION_FAILED_EXT.as_raw(),
++    ));
++    cb.wait_until_completed_for(WAIT).unwrap();
++    assert_eq!(cb.error(), Some(expected));
++    assert_eq!(cb.status(), CommandBufferStatus::Error);
++    assert_eq!(host.bytes(), host.pattern());
++}
++
++#[test]
++#[cfg(target_os = "linux")]
++fn copied_readonly_event_read_never_publishes_a_failed_merge() {
++    use ash::vk;
++    let host = Host::new(43);
++    let backing = Host::new(44);
++    let (device, _heard) = device_with_import(false).unwrap();
++    // SAFETY: buffers outlive registration; this test uses an isolated real Vulkan semaphore.
++    let copy = unsafe {
++        device
++            .shared()
++            .copied
++            .add(host.pointer, backing.pointer, LENGTH)
++    }
++    .unwrap();
++    device.shared().copied.set_read_only_for_test(host.pointer);
++    backing.write(0, &[0xBB; LENGTH]);
++    let event = device.new_shared_event().unwrap();
++    let shared = crate::EventRef::from(&event).shared().clone();
++    shared.keep(1, 7, 0);
++    let signal = vk::SemaphoreSignalInfo::default()
++        .semaphore(shared.semaphore())
++        .value(1);
++    // SAFETY: live device owns this semaphore; no queue uses it.
++    unsafe { device.shared().vk().signal_semaphore(&signal) }.unwrap();
++    assert_eq!(event.signaled_value(), 0);
++    assert_eq!(
++        event.signaled_value(),
++        0,
++        "another observer must not hide the error"
++    );
++    assert_eq!(host.bytes(), host.pattern());
++    assert!(
++        device
++            .shared()
++            .copied
++            .copy_in(&device.shared().counts)
++            .is_err()
++    );
++    drop(copy);
++}

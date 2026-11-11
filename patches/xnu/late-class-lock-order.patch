@@ -1,0 +1,58 @@
+Serialize manual late registration with normal kext loading.
+Preserve native registration and errors; release both locks on OOM.
+
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -330,6 +330,41 @@
+  *    4. sKextLoggingLock
+  */
+ static IORecursiveLock    * sKextLock                  = NULL;
++
++// Late board classes must obey the same lock order as OSRuntimeInitializeCPP:
++// sKextLock -> sStalledClassesLock. Keep the recursive kext lock until the
++// matching post call, including static constructors between these two calls.
++extern "C" void *droidvm_pre_modload(const char *identifier);
++extern "C" OSReturn droidvm_post_modload(void *handle);
++
++extern "C" void *
++droidvm_pre_modload(const char *identifier)
++{
++    if (!identifier || !sKextLock) {
++        return NULL;
++    }
++    IOLog("DROIDVM_CLASS_REGISTER wait=kext module=%s\n", identifier);
++    IORecursiveLockLock(sKextLock);
++    IOLog("DROIDVM_CLASS_REGISTER acquired=kext\n");
++    void *handle = OSMetaClass::preModLoad(identifier);
++    if (!handle) {
++        // preModLoad releases its own lock on allocation failure.
++        IORecursiveLockUnlock(sKextLock);
++        IOLog("DROIDVM_CLASS_REGISTER failed=preModLoad\n");
++    }
++    return handle;
++}
++
++extern "C" OSReturn
++droidvm_post_modload(void *handle)
++{
++    // Only a successful pre call on this same thread permits a post call.
++    IOLog("DROIDVM_CLASS_REGISTER begin=postModLoad\n");
++    OSReturn result = OSMetaClass::postModLoad(handle);
++    IORecursiveLockUnlock(sKextLock);
++    IOLog("DROIDVM_CLASS_REGISTER end=postModLoad status=%#x\n", result);
++    return result;
++}
+ 
+ static OSSharedPtr<OSDictionary>   sKextsByID;
+ static OSSharedPtr<OSDictionary>   sExcludeListByID;
+--- a/libkern/c++/OSMetaClass.cpp
++++ b/libkern/c++/OSMetaClass.cpp
+@@ -788,6 +788,8 @@
+ 	    kKModCapacityIncrement, Z_WAITOK_ZERO, VM_KERN_MEMORY_OSKEXT);
+ 	if (!sStalled->classes) {
+ 		kfree_type(StalledData, sStalled);
++		sStalled = NULL;
++		IOLockUnlock(sStalledClassesLock);
+ 		return NULL;
+ 	}
+ 	OSMETA_ACCUMSIZE((kKModCapacityIncrement * sizeof(OSMetaClass *)) +

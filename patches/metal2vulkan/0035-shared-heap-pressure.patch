@@ -1,0 +1,288 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -1611,16 +1611,28 @@
+         }
+     }
+ 
+-    /// Release every kept empty pooled block of memory type `type_index`, of buffers and of
+-    /// images, as a block of that type fails to be made ([`place`]): how many went.
++    /// Release unused pooled and spare blocks on the failing type's physical heap. Different
++    /// memory types on one heap compete for the same capacity; live placements stay untouched.
++    /// The usual deferred-free path still owns any pending submission lifetime.
+     fn release_kept(&mut self, device: &ash::Device, type_index: u32) -> usize {
+-        let mut blocks: Vec<Block> = [Holds::Buffers, Holds::Images]
+-            .into_iter()
+-            .flat_map(|holds| self.pool(holds, type_index).take_kept())
++        let heap = self.types[type_index as usize].heap_index;
++        let peers: Vec<u32> = self
++            .types
++            .iter()
++            .enumerate()
++            .filter(|(_, ty)| ty.heap_index == heap)
++            .map(|(index, _)| index as u32)
+             .collect();
++        let mut blocks = Vec::new();
++        for peer in peers {
++            for holds in [Holds::Buffers, Holds::Images] {
++                blocks.extend(self.pool(holds, peer).take_kept());
++            }
++        }
++        let types = &self.types;
+         blocks.extend(
+             (self.spare)
+-                .extract_if(.., |spare| spare.pool.1 == type_index)
++                .extract_if(.., |spare| types[spare.pool.1 as usize].heap_index == heap)
+                 .map(|spare| spare.block),
+         );
+         let count = blocks.len();
+@@ -2404,7 +2416,7 @@
+                 return Ok(placement);
+             }
+         }
+-        // The type's kept empty blocks go before a block of it fails to be made.
++        // Retry OOM after releasing unused blocks competing for this heap.
+         let made = match maker.make(device, type_index, block_size, addressed) {
+             Err(Error::OutOfMemory(_)) if lock(memory).release_kept(device, type_index) > 0 => {
+                 maker.make(device, type_index, block_size, addressed)
+@@ -2441,7 +2453,7 @@
+ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &Counters) {
+     let (lacking, maker) = {
+         let mut memory = lock(memory);
+-        if memory.held_back {
++        if memory.held_back || memory.keep_room_cap == 0 {
+             return;
+         }
+         let Ok(kept) = memory.kept(device) else {
+@@ -2686,3 +2698,7 @@
+     }
+     length
+ }
++
++#[cfg(test)]
++#[path = "tests/heap_pressure.rs"]
++mod heap_pressure;
+diff --git a/crates/metal2vulkan-runtime/src/tests/heap_pressure.rs b/crates/metal2vulkan-runtime/src/tests/heap_pressure.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/heap_pressure.rs
+@@ -0,0 +1,219 @@
++//! Exercise real placement/reclamation with a capacity-limited Vulkan dispatch.
++use super::*;
++use ash::vk::Handle;
++use std::{cell::RefCell, collections::BTreeMap, ffi::c_void};
++
++#[derive(Default)]
++struct Driver {
++    live: BTreeMap<u64, (u32, u64)>,
++    freed: Vec<u64>,
++    next: u64,
++    attempts: usize,
++    budget: u64,
++    refusal: Option<vk::Result>,
++}
++thread_local! { static DRIVER: RefCell<Driver> = RefCell::default(); }
++
++unsafe extern "system" fn allocate(
++    _: vk::Device,
++    info: *const vk::MemoryAllocateInfo<'_>,
++    _: *const vk::AllocationCallbacks<'_>,
++    out: *mut vk::DeviceMemory,
++) -> vk::Result {
++    // SAFETY: ash supplies the live input and output for this dispatch.
++    let info = unsafe { &*info };
++    DRIVER.with(|d| {
++        let mut d = d.borrow_mut();
++        d.attempts += 1;
++        if let Some(error) = d.refusal {
++            return error;
++        }
++        let used: u64 = d
++            .live
++            .values()
++            .filter(|(ty, _)| *ty < 2)
++            .map(|(_, n)| *n)
++            .sum();
++        if info.memory_type_index < 2 && used + info.allocation_size > d.budget {
++            return vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
++        }
++        d.next += 1;
++        let handle = d.next;
++        d.live
++            .insert(handle, (info.memory_type_index, info.allocation_size));
++        // SAFETY: ash provides a writable handle.
++        unsafe {
++            *out = vk::DeviceMemory::from_raw(handle);
++        }
++        vk::Result::SUCCESS
++    })
++}
++unsafe extern "system" fn free(
++    _: vk::Device,
++    memory: vk::DeviceMemory,
++    _: *const vk::AllocationCallbacks<'_>,
++) {
++    DRIVER.with(|d| {
++        let mut d = d.borrow_mut();
++        assert!(
++            d.live.remove(&memory.as_raw()).is_some(),
++            "double or unknown free"
++        );
++        d.freed.push(memory.as_raw());
++    });
++}
++
++fn fixture() -> (ash::Device, Mutex<Memory>) {
++    DRIVER.with(|d| {
++        *d.borrow_mut() = Driver {
++            budget: 1024,
++            ..Driver::default()
++        }
++    });
++    // SAFETY: this test only calls these two dispatch entries; ash guards all others.
++    let device = unsafe {
++        ash::Device::load_with(
++            |name| match name.to_bytes() {
++                b"vkAllocateMemory" => allocate as vk::PFN_vkAllocateMemory as *const c_void,
++                b"vkFreeMemory" => free as vk::PFN_vkFreeMemory as *const c_void,
++                _ => std::ptr::null(),
++            },
++            vk::Device::from_raw(1),
++        )
++    };
++    let mut properties = vk::PhysicalDeviceMemoryProperties::default();
++    properties.memory_type_count = 3;
++    for (i, ty) in properties.memory_types[..3].iter_mut().enumerate() {
++        ty.property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
++        ty.heap_index = u32::from(i == 2);
++    }
++    let mut memory = Memory::new(&properties, 128, false, false, vec![0], None, None);
++    memory.block_bytes = 128;
++    (device, Mutex::new(memory))
++}
++
++fn seeded(
++    memory: &Mutex<Memory>,
++    device: &ash::Device,
++    ty: u32,
++    holds: Holds,
++    used: u64,
++    spare: bool,
++) -> u64 {
++    let mut m = lock(memory);
++    let block = m.maker().make(device, ty, 128, None).unwrap();
++    let raw = block.memory.as_raw();
++    if spare {
++        m.spare.push(Spare {
++            pool: (holds, ty),
++            block,
++            since: Instant::now(),
++        });
++    } else {
++        m.add_block((holds, ty), block, 128, false, used);
++    }
++    raw
++}
++
++fn request(memory: &Mutex<Memory>, device: &ash::Device, size: u64) -> Result<Placement, Error> {
++    place(
++        memory,
++        device,
++        &vk::MemoryRequirements {
++            size,
++            alignment: 1,
++            memory_type_bits: 1,
++        },
++        MemoryClass::Private,
++        None,
++        Holds::Buffers,
++        Fit::Apart,
++    )
++}
++
++#[test]
++fn heap_oom_reclaims_peer_idle_blocks_preserving_live_and_other_heap() {
++    let (device, memory) = fixture();
++    let live = seeded(&memory, &device, 1, Holds::Buffers, 64, false);
++    let peer_b = seeded(&memory, &device, 1, Holds::Buffers, 0, false);
++    let peer_i = seeded(&memory, &device, 1, Holds::Images, 0, false);
++    let peer_s = seeded(&memory, &device, 1, Holds::Images, 0, true);
++    let other = seeded(&memory, &device, 2, Holds::Images, 0, false);
++    let other_s = seeded(&memory, &device, 2, Holds::Images, 0, true);
++    DRIVER.with(|d| {
++        let mut d = d.borrow_mut();
++        d.budget = 640;
++        d.attempts = 0;
++    });
++    let placement =
++        request(&memory, &device, 256).expect("peer reclaim makes room for required allocation");
++    DRIVER.with(|d| {
++        let d = d.borrow();
++        assert_eq!(d.attempts, 2, "one OOM and one bounded retry");
++        for raw in [peer_b, peer_i, peer_s] {
++            assert!(d.freed.contains(&raw));
++        }
++        for raw in [live, other, other_s, placement.memory.as_raw()] {
++            assert!(d.live.contains_key(&raw));
++        }
++        assert_eq!(d.freed.len(), 3);
++    });
++    lock(&memory).destroy(&device);
++    DRIVER.with(|d| assert!(d.borrow().live.is_empty()));
++}
++
++#[test]
++fn heap_oom_with_no_idle_capacity_is_returned_without_retry() {
++    let (device, memory) = fixture();
++    seeded(&memory, &device, 1, Holds::Buffers, 64, false);
++    DRIVER.with(|d| {
++        let mut d = d.borrow_mut();
++        d.budget = 128;
++        d.attempts = 0;
++    });
++    assert!(matches!(
++        request(&memory, &device, 256),
++        Err(Error::OutOfMemory(MemoryKind::Device))
++    ));
++    DRIVER.with(|d| {
++        let d = d.borrow();
++        assert_eq!(d.attempts, 1);
++        assert!(d.freed.is_empty());
++    });
++    lock(&memory).destroy(&device);
++}
++
++#[test]
++fn heap_device_loss_does_not_reclaim_or_hide_native_error() {
++    let (device, memory) = fixture();
++    seeded(&memory, &device, 1, Holds::Images, 0, false);
++    DRIVER.with(|d| {
++        let mut d = d.borrow_mut();
++        d.refusal = Some(vk::Result::ERROR_DEVICE_LOST);
++        d.attempts = 0;
++    });
++    assert!(matches!(
++        request(&memory, &device, 256),
++        Err(Error::DeviceLost)
++    ));
++    DRIVER.with(|d| {
++        let d = d.borrow();
++        assert_eq!(d.attempts, 1);
++        assert!(d.freed.is_empty());
++    });
++    lock(&memory).destroy(&device);
++}
++
++#[test]
++fn heap_zero_headroom_avoids_discovery_but_required_allocation_still_works() {
++    let (device, memory) = fixture();
++    lock(&memory).keep_room_cap = 0;
++    keep_room(&memory, &device, &Counters::default());
++    DRIVER.with(|d| assert_eq!(d.borrow().attempts, 0));
++    assert!(
++        lock(&memory).kept.is_none(),
++        "no speculative Vulkan resource discovery"
++    );
++    assert!(request(&memory, &device, 64).is_ok());
++    lock(&memory).destroy(&device);
++}

@@ -1,0 +1,21 @@
+{
+  "profile": "graphical-2g-2cpu-1g-gpu",
+  "private_ram_mib": 2048,
+  "vcpus": 2,
+  "shared_gpu_pool_mib": 1024,
+  "gpu_response_arena_mib_inside_pool": 32,
+  "gpu_command_mib": 16,
+  "block_dma_mib": 1,
+  "scanout": {
+    "width": 1536,
+    "height": 2048,
+    "stride": 6144,
+    "format": "BGRA8888",
+    "mib": 12
+  },
+  "viewer_ring_mib": 36,
+  "data_gib": 6,
+  "display_publication_ceiling_hz": 120,
+  "result": "Graphical boot, wallpaper lock screen, home screen and touch navigation",
+  "frame_rate_scope": "Publication ceiling is not sustained guest UI FPS"
+}

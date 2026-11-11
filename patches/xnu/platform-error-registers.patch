@@ -1,0 +1,19 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -552,8 +552,13 @@
+ static void
+ arm64_implementation_specific_error(arm_saved_state_t *state, uint64_t esr, vm_offset_t far)
+ {
+-#pragma unused (state, esr, far)
+-	panic_plain("Unhandled implementation specific error\n");
++	/* Retain the fatal path and the syndrome needed to diagnose shared IPA faults. */
++	panic_plain("Unhandled implementation specific error: ESR=0x%016llx FAR=0x%016llx "
++	    "PC=0x%016llx LR=0x%016llx X0=0x%016llx\n",
++	    (unsigned long long)esr, (unsigned long long)far,
++	    (unsigned long long)get_saved_state_pc(state),
++	    (unsigned long long)get_saved_state_lr(state),
++	    (unsigned long long)get_saved_state_reg(state, 0));
+ }
+ 
+ #if CONFIG_KERNEL_INTEGRITY

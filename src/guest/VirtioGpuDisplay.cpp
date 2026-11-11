@@ -1,0 +1,479 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// Scanout client of the shared virtio GPU transport. Retain and prepare each IOSurface's
+// memory until RESOURCE_UNREF completes; a timeout deliberately keeps the DMA pages pinned.
+#include "VirtioGpu.h"
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOService.h>
+#include <kern/thread.h>
+#include <kern/clock.h>
+#include <pexpert/pexpert.h>
+extern "C" void native_legacy_gpu_complete(void *, int);
+extern "C" void native_legacy_frame_observed(unsigned, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern "C" uint64_t droidvm_virtgpu_submitted(void);
+extern "C" bool droidvm_virtgpu_finished(uint64_t);
+extern "C" uint64_t droidvm_virtgpu_holds(void);
+extern "C" bool droidvm_virtgpu_held(uint64_t, uint64_t *);
+extern "C" {
+volatile uint32_t droidvm_virtio_display_state, droidvm_virtio_display_blob, droidvm_virtio_display_last_status;
+volatile uint64_t droidvm_virtio_display_frames, droidvm_virtio_display_boot_frames, droidvm_virtio_display_resources;
+// Every swap waits for the GPU work submitted before it, including the first swap after reboot.
+// Setting this to 0 is an unsafe diagnostic A/B override, never the normal display path.
+volatile uint32_t droidvm_virtio_present_wait = 1;
+volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us;
+// Swaps shown although the GPU work before them had not finished in 2 s (a torn frame rather than a stopped display).
+volatile uint64_t droidvm_virtio_present_late;
+// Swaps whose display holds (commits not yet submitted) had not all ended in 200 ms, and the time swaps waited for them (us).
+volatile uint64_t droidvm_virtio_display_hold_late, droidvm_virtio_display_hold_wait_us;
+// Swaps offered by the time since the one before (1 ms buckets, the last for 40 ms and longer); of those under 50 ms, how many and
+// their total (us): the frame rate while something animates, without the idle time between gestures. And swaps refused because
+// one was still waiting for the worker.
+volatile uint64_t droidvm_virtio_offer_gap_hist[41], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;
+// The surfaces the display keeps prepared (wired) for the host: how many, and their bytes.
+volatile uint64_t droidvm_virtio_display_wired[2];
+// 1: a swap completes for the compositor once its scanout and flush are posted -- the host's copy is queued on the GPU -- rather than
+// once the host answers that the copy is done (about 2.8 ms later, 9.5 at p90). CoreAnimation keeps at most two swaps in flight and
+// waits for the oldest to complete before it submits a third (IOMFBDisplay::can_update_, swap_wait_timeout): with completion after
+// the copy, a swap's trip (the encoding thread's 3 ms, the GPU's 6.5, the copy's 2.8) left 2.7 ms of the two refresh periods, and a
+// slow GPU frame made CoreAnimation skip a refresh (130 ms of 4 s of page swipes waiting there). Page swipes: 98 fps against 82, in
+// one boot. The compositor draws into this frame's surface again three frames later (three framebuffers), which the guest GPU
+// runs after the two frames before it: of 1400 host copies, none began after a second guest frame had begun drawing (the copy
+// starts 2 ms after the frame's GPU work at p50, 12 at most, and runs before the guest's work, at a higher priority). 0:
+// completion after the answer, as before (an A/B switch, written in guest memory). Frames whose flush failed after: post_failures.
+volatile uint32_t droidvm_virtio_complete_on_post = 1;
+volatile uint64_t droidvm_virtio_completed_on_post, droidvm_virtio_post_failures;
+uint64_t lastOfferUs;
+// 1: a frame's scanout and flush are posted and collected while the next frame's GPU work is awaited (the worker's Flight);
+// 0: each frame waits for its flush before the next is taken, as before (an A/B switch, written in guest memory).
+volatile uint32_t droidvm_virtio_present_pipeline = 1;
+// The last resource create() refused: which check (1 arguments, 2 prepare, 3 longer than the memory, 4 a segment, 5 the host),
+// its status, then length, stride, width, height, the segments described so far and the segment that failed (address, length).
+volatile uint64_t droidvm_virtio_display_create_fail[10], droidvm_virtio_display_create_fails;
+// The scanout's refresh rate in Hz from the device's EDID (its first detailed timing), 0 without one: the VM's display setting
+// (crosvm's refresh-rate), which the display reports to the compositor (LegacyDisplayProbe.cpp, native_legacy_refresh_hz).
+volatile uint32_t droidvm_virtio_display_refresh_hz;
+struct DroidVMPresentSample { uint64_t number; uint32_t fence, retired, mode, status; uint64_t wait_us, flush_us; };
+DroidVMPresentSample droidvm_virtio_present_samples[64];
+}
+namespace {
+using namespace DroidVMVirtioGpu;
+struct Rect { uint32_t x, y, width, height; };
+// used: when the resource was last shown (useClock), so the cache gives up the one shown longest ago.
+struct Resource {
+    IOMemoryDescriptor *memory;
+    uint64_t stride, used;
+    uint32_t width, height, id;
+    bool prepared, usable;
+};
+// work: the virtio GPU's fenced submissions made before the swap (droidvm_virtgpu_submitted). The frame is drawn once they have
+// finished. holds: the display holds taken before the swap (droidvm_virtgpu_holds): commits whose work was not submitted yet, which
+// the frame waits for, its work then the larger of the two.
+struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; uint32_t width, height; uint64_t work, holds; };
+// The compositor's surfaces: more than it keeps in flight, since during an animation it presents from a larger set than at rest
+// (8 entries were recreated on almost every frame of a page drag).
+Resource resources[32], boot;
+uint64_t useClock;
+// The guest kernel's page (arm64 iOS): a surface's memory is whole pages of it.
+constexpr uint64_t GuestPage = 16384;
+// Zeroed memory that ends a blob when its own last page has no room left (it ends on a page boundary), or is not known to be
+// its own (the boot framebuffer): what the host's driver asks beyond stride x height, which its copy of the visible rows never
+// reads. Up to 3 rows and a page (create()): enough for rows of up to 5120 pixels; a wider one gets no padding.
+constexpr uint64_t PaddingBytes = 4 * GuestPage;
+IOBufferMemoryDescriptor *padding;
+uint64_t paddingAddress;
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+Entry *entries;            // worker-owned scratch, allocated when the display starts (the native __DATA of a fileset has no room)
+#else
+Entry entries[MaxEntries]; // worker-owned scratch, never shared with another producer
+#endif
+IOLock *frameLock;
+Frame pending;
+bool started, compositor, bootDirty;
+uint32_t activeResource;
+uint64_t nowUs() { uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000; }
+
+template <typename T> IOReturn send(T &cmd) {
+    Header reply = {}; return command(&cmd, sizeof cmd, nullptr, 0, &reply, sizeof reply);
+}
+bool release(Resource &r) {
+    if (r.id && unref(r.id)) return false;
+    if (r.prepared) {
+        r.memory->complete(kIODirectionOut);
+        droidvm_virtio_display_wired[0] = droidvm_virtio_display_wired[0] - 1;
+        droidvm_virtio_display_wired[1] = droidvm_virtio_display_wired[1] - r.memory->getLength();
+    }
+    OSSafeReleaseNULL(r.memory); r = {}; return true;
+}
+// surface: the memory is a compositor surface, whose last page is all its own (the boot framebuffer's is not known to be).
+IOReturn refused(unsigned check, IOReturn status, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height,
+                 uint32_t count = 0, uint64_t pa = 0, uint64_t length = 0) {
+    const uint64_t fail[10] = {check, uint32_t(status), memory ? memory->getLength() : 0, stride, width, height, count, pa, length, 0};
+    for (unsigned i = 0; i < 10; ++i) droidvm_virtio_display_create_fail[i] = fail[i];
+    droidvm_virtio_display_create_fails = droidvm_virtio_display_create_fails + 1;
+    return status;
+}
+IOReturn create(Resource &r, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height, bool surface = false) {
+    if (!width || width > 16384 || !height || height > 16384 || stride < uint64_t(width) * 4 ||
+        stride % 4 || stride > 65536 || memory->getLength() < stride * height)
+        return refused(1, kIOReturnBadArgument, memory, stride, width, height);
+    r.memory = memory; memory->retain(); r.stride = stride; r.width = width; r.height = height;
+    IOReturn status = memory->prepare(kIODirectionOut);
+    if (status) { OSSafeReleaseNULL(r.memory); return refused(2, status, memory, stride, width, height); }
+    r.prepared = true;
+    droidvm_virtio_display_wired[0] = droidvm_virtio_display_wired[0] + 1;
+    droidvm_virtio_display_wired[1] = droidvm_virtio_display_wired[1] + memory->getLength();
+    uint64_t bytes = stride * height, described = bytes;
+    if (droidvm_virtio_display_blob) {
+        bytes = described = (bytes + 4095) & ~4095ULL;
+        if (bytes > memory->getLength()) { refused(3, kIOReturnBadArgument, memory, stride, width, height); release(r); return kIOReturnBadArgument; }
+        // The host may import the blob as an image of these dimensions, and its driver asks for more memory than stride x
+        // height: Turnip lays the last level of a LINEAR image out over rows to a multiple of 4, which its 16x4 blits may
+        // over-fetch (freedreno fd6_layout.c). It refused a 1024x1366 blob 8 KiB short of 1368 rows, and that frame took the
+        // host's CPU copy. The boot framebuffer was one of them: it is shown again whenever the compositor blanks the panel
+        // (between two GFXBench tests), and each such frame switched the host's window between its producers.
+        bytes = (stride * ((uint64_t(height) + 3) & ~3ULL) + 4095) & ~4095ULL;
+    }
+    uint32_t count = 0;
+    for (uint64_t offset = 0; offset < described;) {
+        IOByteCount length = 0;
+        uint64_t pa = memory->getPhysicalSegment(offset, &length);
+        if (length > described - offset) length = described - offset;
+        if (!pa || !length || length > UINT32_MAX || count == MaxEntries ||
+            (droidvm_virtio_display_blob && ((pa | length) & 4095))) {
+            refused(4, kIOReturnBadArgument, memory, stride, width, height, count, pa, length);
+            release(r); return kIOReturnBadArgument;
+        }
+        entries[count++] = {pa, uint32_t(length), 0}; offset += length;
+    }
+    if (bytes > described) {
+        // A surface: the rest of the page the last segment ends in, which is all its own, where the descriptor stops short of
+        // it. With no room there (2 of the compositor's 3 framebuffers), and always for the boot framebuffer: the padding.
+        Entry &last = entries[count - 1];
+        const uint64_t end = last.address + last.length, pageEnd = (end + GuestPage - 1) & ~(GuestPage - 1);
+        if (surface && pageEnd - end >= bytes - described) last.length += uint32_t(bytes - described);
+        else if (paddingAddress && count < MaxEntries && bytes - described <= PaddingBytes)
+            entries[count++] = {paddingAddress, uint32_t(bytes - described), 0};
+        else bytes = described;
+    }
+    r.id = resourceId();
+    Header reply = {};
+    bool created = false;
+    if (droidvm_virtio_display_blob) {
+        struct { Header h; uint32_t id, memory, flags, count; uint64_t blob, size; }
+            cmd = {{0x10c, 0, 0, 0, 0, {}}, r.id, 1, 8, count, 0, bytes};
+        status = command(&cmd, sizeof cmd, entries, count * sizeof(Entry), &reply, sizeof reply);
+        created = !status;
+    } else {
+        struct { Header h; uint32_t id, format, width, height; } cmd = {{0x101, 0, 0, 0, 0, {}}, r.id, 2, uint32_t(stride / 4), height};
+        status = command(&cmd, sizeof cmd, nullptr, 0, &reply, sizeof reply);
+        created = !status;
+        if (!status) {
+            struct { Header h; uint32_t id, count; } attach = {{0x106, 0, 0, 0, 0, {}}, r.id, count};
+            status = command(&attach, sizeof attach, entries, count * sizeof(Entry), &reply, sizeof reply);
+        }
+    }
+    if (status) {
+        refused(5, status, memory, stride, width, height, count, reply.type, bytes);
+        // A valid error to CREATE means the resource doesn't exist. A transport failure is
+        // ambiguous, so leave both the resource id and prepared pages owned until reboot.
+        if (!created && ready() && reply.type >= 0x1200) r.id = 0;
+        if (ready()) release(r);
+        return status;
+    }
+    droidvm_virtio_display_resources = droidvm_virtio_display_resources + 1;
+    r.usable = true;
+    return kIOReturnSuccess;
+}
+// The refresh rate of scanout 0's mode: GET_EDID, then the first detailed timing descriptor's pixel clock (10 kHz units) over its
+// total pixels (active plus blanking, across and down). 0 where the device has no EDID or no timing.
+uint32_t refreshFromEdid() {
+    if (!(DroidVMVirtioGpu::features() & (1u << 1))) return 0;
+    struct { Header h; uint32_t scanout, padding; } cmd = {{0x10a, 0, 0, 0, 0, {}}, 0, 0};
+    struct { Header h; uint32_t size, padding; uint8_t edid[1024]; } reply = {};
+    if (command(&cmd, sizeof cmd, nullptr, 0, &reply, sizeof reply) || reply.h.type != 0x1104 || reply.size < 72) return 0;
+    const uint8_t *t = reply.edid + 54;
+    const uint64_t clock = uint64_t(t[0] | t[1] << 8) * 10000;
+    const uint32_t across = (t[2] | (t[4] >> 4) << 8) + (t[3] | (t[4] & 15) << 8);
+    const uint32_t down = (t[5] | (t[7] >> 4) << 8) + (t[6] | (t[7] & 15) << 8);
+    return clock && across && down ? uint32_t((clock + uint64_t(across) * down / 2) / (uint64_t(across) * down)) : 0;
+}
+// A frame's scanout and flush posted, not waited for (blob resources): their tickets, collected by land() in the worker.
+struct Posted { uint32_t tickets[2]; uint32_t count; };
+IOReturn present(Resource &r, Posted *posted = nullptr) {
+    IOReturn status;
+    if (posted && droidvm_virtio_display_blob) {
+        // The host takes the control queue's commands in order, so the flush follows its scanout without waiting for it.
+        posted->count = 0;
+        if (activeResource != r.id) {
+            struct { Header h; Rect rect; uint32_t scanout, id, width, height, format, padding, strides[4], offsets[4]; }
+                scanout = {{0x10d, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, 0, r.id, r.width, r.height, 2, 0, {uint32_t(r.stride)}, {}};
+            status = DroidVMVirtioGpu::post(&scanout, sizeof scanout, nullptr, 0, sizeof(Header), true, &posted->tickets[posted->count]);
+            if (status) return status;
+            posted->count++;
+            activeResource = r.id;
+        }
+        struct { Header h; Rect rect; uint32_t id, padding; } flush = {{0x104, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, r.id, 0};
+        status = DroidVMVirtioGpu::post(&flush, sizeof flush, nullptr, 0, sizeof(Header), true, &posted->tickets[posted->count]);
+        if (!status) posted->count++;
+        return status;
+    }
+    if (posted) posted->count = 0;
+    if (!droidvm_virtio_display_blob) {
+        struct { Header h; Rect rect; uint64_t offset; uint32_t id, padding; }
+            transfer = {{0x105, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, 0, r.id, 0};
+        status = send(transfer); if (status) return status;
+    }
+    if (activeResource != r.id) {
+        if (droidvm_virtio_display_blob) {
+            struct { Header h; Rect rect; uint32_t scanout, id, width, height, format, padding, strides[4], offsets[4]; }
+                scanout = {{0x10d, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, 0, r.id, r.width, r.height, 2, 0, {uint32_t(r.stride)}, {}};
+            status = send(scanout);
+        } else {
+            struct { Header h; Rect rect; uint32_t scanout, id; } scanout = {{0x103, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, 0, r.id};
+            status = send(scanout);
+        }
+        if (status) return status;
+        activeResource = r.id;
+    }
+    struct { Header h; Rect rect; uint32_t id, padding; } flush = {{0x104, 0, 0, 0, 0, {}}, {0, 0, r.width, r.height}, r.id, 0};
+    return send(flush);
+}
+Resource *surface(const Frame &frame) {
+    for (auto &r : resources) if (r.memory == frame.memory && r.usable && r.id && r.stride == frame.stride &&
+        r.width == frame.width && r.height == frame.height) { r.used = ++useClock; return &r; }
+    Resource *slot = nullptr;
+    for (auto &r : resources) if (!r.memory) { slot = &r; break; }
+    if (!slot) {
+        Resource *oldest = nullptr;
+        for (auto &r : resources) if (r.id != activeResource && (!oldest || r.used < oldest->used)) oldest = &r;
+        if (oldest && release(*oldest)) slot = oldest;
+    }
+    if (!slot) return nullptr;
+    IOReturn status = create(*slot, frame.memory, frame.stride, frame.width, frame.height, true);
+    droidvm_virtio_display_last_status = status;
+    if (status) return nullptr;
+    slot->used = ++useClock;
+    return slot;
+}
+void worker(void *, wait_result_t) {
+    PE_Video video = {};
+    if (PE_current_console(&video) || !video.v_baseAddr) { droidvm_virtio_display_state = 3; return; }
+    IODeviceMemory *memory = IODeviceMemory::withRange(video.v_baseAddr, (video.v_rowBytes * video.v_height + 4095) & ~4095ULL);
+    IOReturn status = memory ? create(boot, memory, video.v_rowBytes, video.v_width, video.v_height) : kIOReturnNoMemory;
+    OSSafeReleaseNULL(memory);
+    if (status) { droidvm_virtio_display_last_status = status; droidvm_virtio_display_state = 3; return; }
+    droidvm_virtio_display_state = 2;
+    unsigned idle = 100;
+    // The frame whose scanout and flush are posted: the host shows it while this thread waits for the next frame's GPU work, so
+    // a frame costs the longer of the two rather than their sum (5.3 ms of GPU work and 6.1 ms of flush a 2048x2732 frame, one
+    // after the other, held page swipes to 72 fps). It completes (land()) before the next frame is posted, or when no frame
+    // follows it, so one flush at most is in flight and frames complete in order.
+    struct Flight { Frame frame; Posted posted; uint64_t sample, waited, flushBegin; uint32_t mode, collected; IOReturn result; bool drawn,
+                    completed; };
+    Flight flight = {};
+    bool inFlight = false;
+    // The frame in flight's replies, waited for (block) or as far as the device has returned them: true once all are in.
+    auto collect = [&](bool block) -> bool {
+        for (uint32_t i = 0; i < flight.posted.count; ++i) {
+            if (flight.collected & (1u << i)) continue;
+            Header reply = {};
+            IOReturn one = kIOReturnSuccess;
+            if (block) one = DroidVMVirtioGpu::wait(flight.posted.tickets[i], 5000000, &reply, sizeof reply);
+            else if (!DroidVMVirtioGpu::poll(flight.posted.tickets[i], &one, &reply, sizeof reply)) return false;
+            flight.collected |= 1u << i;
+            if (one && !flight.result) flight.result = one;
+        }
+        return true;
+    };
+    auto land = [&]() -> bool {
+        collect(true);
+        const IOReturn result = flight.result;
+        inFlight = false;
+        const Frame &f = flight.frame;
+        droidvm_virtio_present_samples[flight.sample % 64] = {flight.sample + 1, uint32_t(f.work), uint32_t(flight.drawn ? f.work : 0),
+            flight.mode, uint32_t(result), flight.waited, nowUs() - flight.flushBegin};
+        droidvm_virtio_display_last_status = result;
+        if (!ready()) {
+            droidvm_virtio_display_state = 3;
+            IOLog("virtio-gpu: scanout stopped with outstanding DMA, status %x\n", result);
+            return false;
+        }
+        if (!result) {
+            droidvm_virtio_display_frames = droidvm_virtio_display_frames + 1;
+            native_legacy_frame_observed(2, 0, 0, 0, f.width, f.height);
+        }
+        if (!flight.completed) native_legacy_gpu_complete(f.display, result);
+        else if (result) droidvm_virtio_post_failures = droidvm_virtio_post_failures + 1;
+        f.memory->release(); f.display->release();
+        return true;
+    };
+    // While the next frame waits for its holds or its GPU work: the frame in flight completes as soon as its flush is back, not
+    // after that wait -- its swap's completion may be what the next frame's work waits for (a commit that returned before its
+    // submission: the render server's next frame can wait for the last swap to retire, and the two would wait for each other).
+    // False: the display stopped.
+    auto landEarly = [&]() -> bool { return !inFlight || !collect(false) || land(); };
+    for (;;) {
+        IOLockLock(frameLock);
+        Frame frame = pending; pending = {};
+        bool showBoot = (!compositor && idle >= 100) || bootDirty;
+        bootDirty = false;
+        IOLockUnlock(frameLock);
+        if (!frame.memory && inFlight) {
+            // No frame behind the one in flight: complete it now rather than when the next comes.
+            if (!land()) return;
+            continue;
+        }
+        if (frame.memory) {
+            const uint32_t mode = droidvm_virtio_present_wait;
+            const uint64_t begin = nowUs();
+            uint64_t order = 0;
+            bool held = droidvm_virtgpu_held(frame.holds, &order);
+            while (!held && nowUs() - begin < 200000) {
+                if (!landEarly()) return;
+                if (nowUs() - begin < 50) IODelay(5);
+                else delay_for_interval(100, NSEC_PER_USEC);
+                held = droidvm_virtgpu_held(frame.holds, &order);
+            }
+            if (!held) droidvm_virtio_display_hold_late = droidvm_virtio_display_hold_late + 1;
+            else if (order > frame.work) frame.work = order;
+            droidvm_virtio_display_hold_wait_us = droidvm_virtio_display_hold_wait_us + (nowUs() - begin);
+            bool drawn = droidvm_virtgpu_finished(frame.work);
+            const bool busy = !drawn;
+            while (mode && !drawn && nowUs() - begin < 2000000) {
+                // GPU work: wait for the device to return a command (the transport's one watch, which sleeps on the interrupt),
+                // at most 1 ms at a time so the frame in flight still lands early and a busy client lock is looked at again.
+                // IOSleep's 1 ms added half a millisecond a frame on average to a display that paces the compositor (offered ->
+                // done 14-16 ms of a 17-19 ms frame).
+                if (!landEarly()) return;
+                const uint64_t seen = DroidVMVirtioGpu::returns();
+                drawn = droidvm_virtgpu_finished(frame.work);
+                if (!drawn) DroidVMVirtioGpu::awaitReturn(seen, nowUs() + 1000);
+            }
+            if (!drawn) droidvm_virtio_present_late = droidvm_virtio_present_late + 1;
+            const uint64_t waited = nowUs() - begin;
+            uint64_t sample = droidvm_virtio_present_probes;
+            droidvm_virtio_present_probes = sample + 1;
+            if (busy) droidvm_virtio_present_busy = droidvm_virtio_present_busy + 1;
+            droidvm_virtio_present_wait_us = droidvm_virtio_present_wait_us + waited;
+            Resource *r = surface(frame);
+            // The frame before completes first: its flush ran on the host while this frame's GPU work was awaited.
+            if (inFlight && !land()) return;
+            const uint64_t flushBegin = nowUs();
+            Posted posted = {};
+            status = r ? present(*r, droidvm_virtio_present_pipeline ? &posted : nullptr) : kIOReturnIOError;
+            if (!status && posted.count) {
+                flight = {frame, posted, sample, waited, flushBegin, mode, 0, kIOReturnSuccess, drawn, false};
+                inFlight = true;
+                if (droidvm_virtio_complete_on_post) {
+                    native_legacy_gpu_complete(frame.display, kIOReturnSuccess);
+                    flight.completed = true;
+                    droidvm_virtio_completed_on_post = droidvm_virtio_completed_on_post + 1;
+                }
+            } else {
+                // Refused before the host had it, or presented synchronously: complete it here as before.
+                // The sample's fence is the swap's work number, and retired the same once that work was drawn.
+                droidvm_virtio_present_samples[sample % 64] = {sample + 1, uint32_t(frame.work), uint32_t(drawn ? frame.work : 0), mode,
+                    uint32_t(status), waited, nowUs() - flushBegin};
+                droidvm_virtio_display_last_status = status;
+                if (!ready()) {
+                    // An unacknowledged display DMA is not a completed frame. Keep this swap and its
+                    // references; recovery must quiesce the GPU before it can retire them. CPU
+                    // fallback would also race the writer.
+                    droidvm_virtio_display_state = 3;
+                    IOLog("virtio-gpu: scanout stopped with outstanding DMA, status %x\n", status);
+                    return;
+                }
+                if (!status) {
+                    droidvm_virtio_display_frames = droidvm_virtio_display_frames + 1;
+                    native_legacy_frame_observed(2, 0, 0, 0, frame.width, frame.height);
+                }
+                // The display workloop serializes this callback with offer(), so gpuRequest has
+                // been recorded before completion even if the host answered immediately.
+                native_legacy_gpu_complete(frame.display, status);
+                frame.memory->release(); frame.display->release();
+            }
+        } else if (showBoot && ready()) {
+            status = present(boot); idle = 0;
+            droidvm_virtio_display_last_status = status;
+            if (!status) droidvm_virtio_display_boot_frames = droidvm_virtio_display_boot_frames + 1;
+        }
+        // Until the next frame is offered (offer() wakes this), or 1 ms for the boot console's cadence: a frame no longer waits
+        // up to a millisecond to be taken. Once a compositor has offered a frame the boot console shows only when made dirty,
+        // which wakes this too, so there is nothing to look at between wakes: the 1 ms steps woke a vCPU a thousand times a
+        // second on a still screen (0.2 s of CPU in 10 s, 2026-11-06).
+        IOLockLock(frameLock);
+        if (!pending.memory && !bootDirty) {
+            if (compositor) {
+                IOLockSleep(frameLock, &pending, THREAD_UNINT);
+            } else {
+                uint64_t deadline;
+                clock_interval_to_deadline(1, kMillisecondScale, &deadline);
+                IOLockSleepDeadline(frameLock, &pending, deadline, THREAD_UNINT);
+            }
+        }
+        IOLockUnlock(frameLock);
+        ++idle;
+    }
+}
+}
+extern "C" void droidvm_virtio_gpu_display_start(void) {
+    if (started) return; started = true;
+    if (!DroidVMVirtioGpu::start()) return;
+    DroidVMVirtioGpu::selftest3D();
+    // Gunyah's initial native-context backend has no scanout commands. Keep
+    // NativeGOPPresenter in charge while qualifying the shared GPU transport.
+    unsigned transportOnly = 0;
+    PE_parse_boot_argn("vgpu-transport-only", &transportOnly, sizeof transportOnly);
+    if (transportOnly) {
+        IOLog("virtio-gpu: transport only; firmware scanout retained\n");
+        return;
+    }
+    // The refresh rate: droidvm-display-hz (30 to 240) when given, as the macOS board's DroidVMDisplay takes it, else the EDID's.
+    // An EDID detailed timing carries a pixel clock of at most 655.35 MHz, so crosvm advertises 2048x2732 at 110 Hz although the
+    // VM's display runs at 120, and the compositor paced its frames at 110.
+    unsigned hz = 0;
+    PE_parse_boot_argn("droidvm-display-hz", &hz, sizeof hz);
+    const uint32_t edidHz = refreshFromEdid();
+    droidvm_virtio_display_refresh_hz = hz >= 30 && hz <= 240 ? hz : edidHz;
+    IOLog("virtio-gpu: scanout refresh %u Hz (EDID %u Hz)\n", droidvm_virtio_display_refresh_hz, edidHz);
+    unsigned blob = 1; PE_parse_boot_argn("droidvm-virtio-gpu-blob", &blob, sizeof blob);
+    droidvm_virtio_display_blob = blob && ((DroidVMVirtioGpu::features() & 0x48) == 0x48);
+    frameLock = IOLockAlloc(); if (!frameLock) { droidvm_virtio_display_state = 3; return; }
+#if DROIDVM_VIRTIO_GPU_DYNAMIC
+    entries = IONew(Entry, MaxEntries); if (!entries) { droidvm_virtio_display_state = 3; return; }
+#endif
+    padding = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+        IOOptionBits(kIODirectionInOut) | IOOptionBits(kIOMemoryPhysicallyContiguous), PaddingBytes, ~uint64_t(4095));
+    if (padding && padding->prepare() == kIOReturnSuccess) {
+        bzero(padding->getBytesNoCopy(), PaddingBytes);
+        paddingAddress = padding->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    }
+    droidvm_virtio_display_state = 1;
+    thread_t thread;
+    if (kernel_thread_start(worker, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    else droidvm_virtio_display_state = 3;
+}
+extern "C" bool droidvm_virtio_gpu_offer(void *display, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height) {
+    if (droidvm_virtio_display_state != 2 || !DroidVMVirtioGpu::ready()) return false;
+    IOLockLock(frameLock);
+    const uint64_t now = nowUs();
+    if (lastOfferUs) {
+        const uint64_t gap = now - lastOfferUs;
+        droidvm_virtio_offer_gap_hist[gap / 1000 < 40 ? gap / 1000 : 40] = droidvm_virtio_offer_gap_hist[gap / 1000 < 40 ? gap / 1000 : 40] + 1;
+        if (gap < 50000) { droidvm_virtio_offer_gaps[0] = droidvm_virtio_offer_gaps[0] + 1; droidvm_virtio_offer_gaps[1] = droidvm_virtio_offer_gaps[1] + gap; }
+    }
+    lastOfferUs = now;
+    bool accepted = !pending.memory;
+    if (!accepted) droidvm_virtio_offer_refused = droidvm_virtio_offer_refused + 1;
+    if (accepted) {
+        auto service = static_cast<IOService *>(display);
+        memory->retain(); service->retain(); pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted(), droidvm_virtgpu_holds()};
+        compositor = true;
+        IOLockWakeup(frameLock, &pending, true);
+    }
+    IOLockUnlock(frameLock); return accepted;
+}
+extern "C" void droidvm_virtio_gpu_boot_dirty(void) {
+    if (!frameLock) return;
+    IOLockLock(frameLock); bootDirty = true; IOLockWakeup(frameLock, &pending, true); IOLockUnlock(frameLock);
+}

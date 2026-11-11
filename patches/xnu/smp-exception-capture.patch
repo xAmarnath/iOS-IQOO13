@@ -1,0 +1,54 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -990,6 +990,41 @@
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+ 		if (ss != NULL) {
+ 			uint64_t pc = get_saved_state_pc(ss);
++			/* Capture the exact cache slide before concurrent panic output.
++			 * Read only this thread's map, with copyin fault recovery and small,
++			 * independently tagged records. No key values or PAC policy changes.
++			 */
++			uint64_t sp = get_saved_state_sp(ss);
++			uint64_t tid = thread_tid(thread);
++			uint32_t slide = task->task_shared_region_slide;
++			printf("droidvm-exc-meta tid=%llu cpu=%d pid=%d slide=0x%x pc=0x%llx sp=0x%llx fp=0x%llx lr=0x%llx current=%d\n",
++			    tid, cpu_number(), proc_pid(get_bsdtask_info(task)), slide, pc, sp,
++			    get_saved_state_fp(ss), get_saved_state_lr(ss), thread == current_thread());
++			if (thread == current_thread()) {
++				uint64_t control, translation;
++				__asm__ volatile ("mrs %0, sctlr_el1\n mrs %1, tcr_el1"
++				    : "=r"(control), "=r"(translation));
++				printf("droidvm-exc-control tid=%llu cpu=%d sctlr=0x%llx tcr=0x%llx slide=0x%x\n",
++				    tid, cpu_number(), control, translation, slide);
++				if (pc >= 32 && pc <= UINT64_MAX - 32) {
++					for (unsigned i = 0; i < 16; i++) {
++						uint64_t at = pc - 32 + i * sizeof(uint32_t);
++						uint32_t word = 0;
++						int error = copyin((user_addr_t)at, &word, sizeof(word));
++						printf("droidvm-exc-insn tid=%llu at=0x%llx slide=0x%x err=%d word=%08x\n",
++						    tid, at, slide, error, word);
++					}
++				}
++				if (sp >= 128 && sp <= UINT64_MAX - 128) {
++					for (unsigned i = 0; i < 16; i++) {
++						uint64_t at = sp - 128 + i * 16;
++						uint64_t words[2] = {};
++						int error = copyin((user_addr_t)at, words, sizeof(words));
++						printf("droidvm-exc-stack tid=%llu at=0x%llx err=%d words=%016llx,%016llx\n",
++						    tid, at, error, words[0], words[1]);
++					}
++				}
++			}
+ 			/* The boot log's copy (the message buffer wraps long before a late look at it): the last four, with the frame chain. */
+ 			{
+ 				struct sheng_exc_record *rec = &sheng_exc_ring[sheng_exc_count & 3];
+@@ -1019,7 +1054,8 @@
+ 				    r + 2 < 29 ? get_saved_state_reg(ss, r + 2) : 0ULL, r + 3 < 29 ? get_saved_state_reg(ss, r + 3) : 0ULL);
+ 			}
+ 			uint32_t insn[8] = {};
+-			if (copyin((user_addr_t)(pc - 16), insn, sizeof(insn)) == 0) {
++			if (thread == current_thread() && pc >= 16 &&
++			    copyin((user_addr_t)(pc - 16), insn, sizeof(insn)) == 0) {
+ 				printf("sheng-exc: insn@pc-16 %08x %08x %08x %08x | %08x %08x %08x %08x\n",
+ 				    insn[0], insn[1], insn[2], insn[3], insn[4], insn[5], insn[6], insn[7]);
+ 			}

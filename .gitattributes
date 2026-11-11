@@ -1,0 +1,13 @@
+* text=auto eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.inc text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.patch text eol=lf
+*.json text eol=lf
+series text eol=lf
+*.png binary
+*.gif binary
+*.mp4 binary

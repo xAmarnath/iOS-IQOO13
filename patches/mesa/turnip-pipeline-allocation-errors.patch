@@ -1,0 +1,48 @@
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -4561,15 +4561,18 @@
+ 
+    result = tu_pipeline_allocate_cs(builder->device, *pipeline,
+                                     &builder->layout, builder, NULL);
+-
++   if (result != VK_SUCCESS) {
++      /* Library-linked pipelines also need command storage. Never emit state
++       * through the zero-initialized cs after suballocation fails.
++       */
++      tu_pipeline_finish(*pipeline, builder->device, builder->alloc);
++      vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
++      return result;
++   }
+ 
+    if (set_combined_state(builder, *pipeline,
+                           VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+                           VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) {
+-      if (result != VK_SUCCESS) {
+-         vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
+-         return result;
+-      }
+ 
+       tu_emit_program_state<CHIP>(&(*pipeline)->cs, &(*pipeline)->program,
+                                   (*pipeline)->shaders);
+@@ -4598,6 +4601,12 @@
+    }
+ 
+    tu_pipeline_builder_emit_state<CHIP>(builder, *pipeline);
++   if ((*pipeline)->cs.status != VK_SUCCESS) {
++      result = (*pipeline)->cs.status;
++      tu_pipeline_finish(*pipeline, builder->device, builder->alloc);
++      vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
++      return result;
++   }
+ 
+    if ((*pipeline)->type == TU_PIPELINE_GRAPHICS_LIB) {
+       struct tu_graphics_lib_pipeline *library =
+@@ -4610,6 +4619,7 @@
+                                                &library->state_data);
+       if (result != VK_SUCCESS) {
+          tu_pipeline_finish(*pipeline, builder->device, builder->alloc);
++         vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
+          return result;
+       }
+    } else {

@@ -1,0 +1,72 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -491,12 +491,35 @@
+    va->used -= size;
+ }
+ 
++/* The shared transport maps whole 16KiB pages even when Vulkan asks for
++ * fewer bytes. Reserve and release that same extent, including lazy VMAs.
++ * CPU page size alone is not the shared GPU mapping alignment. */
++static uint64_t
++darwin_iova_size(uint64_t size)
++{
++   if (!dwv_gunyah_shared())
++      return size;
++   return size && size <= UINT64_MAX - 16383 ? (size + 16383) & ~16383ull : 0;
++}
++
++static uint64_t
++darwin_iova_alignment(void)
++{
++   return dwv_gunyah_shared() && os_page_size < 16384 ? 16384 : os_page_size;
++}
++
+ static VkResult
+ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
+                      enum tu_bo_alloc_flags flags, uint64_t *iova)
+ {
+    struct darwin_va *va = &((struct darwin_retire_state *)dev->darwin_retire)->va;
+    *iova = 0;
++   size = darwin_iova_size(size);
++   const uint64_t alignment = darwin_iova_alignment();
++   if (!size)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   if ((flags & TU_BO_ALLOC_REPLAYABLE) && client_iova && (client_iova & (alignment - 1)))
++      return VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+    mtx_lock(&dev->vma_mutex);
+    if (!va->seeded) {
+       /* Nothing else allocates from the heap the device made: the whole range is free. */
+@@ -512,10 +535,10 @@
+             return VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+          }
+       } else {
+-         *iova = darwin_va_alloc(va, size, os_page_size, true);
++         *iova = darwin_va_alloc(va, size, alignment, true);
+       }
+    } else {
+-      *iova = darwin_va_alloc(va, size, os_page_size, false);
++      *iova = darwin_va_alloc(va, size, alignment, false);
+    }
+    /* An address range is what this device runs out of without the kernel refusing anything (the virtio GPU gives each context a
+     * slice of the host GPU's address space, 2 GiB): say so, with what the range holds, so a lost device is traced to it. */
+@@ -532,7 +555,7 @@
+ {
+    struct darwin_va *va = &((struct darwin_retire_state *)dev->darwin_retire)->va;
+    mtx_lock(&dev->vma_mutex);
+-   darwin_va_free(va, iova, size);
++   darwin_va_free(va, iova, darwin_iova_size(size));
+    mtx_unlock(&dev->vma_mutex);
+ }
+ 
+@@ -838,6 +861,10 @@
+ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+                    uint64_t size, kern_return_t map_error, bool owns_iova = true)
+ {
++   mesa_loge("darwin: BoMap error=0x%x handle=%llu iova=%#llx bytes=%llu va=%#llx+%#llx alignment=%llu shared=%u",
++             map_error, (unsigned long long)handle, (unsigned long long)iova, (unsigned long long)size,
++             (unsigned long long)dev->physical_device->va_start, (unsigned long long)dev->physical_device->va_size,
++             (unsigned long long)darwin_iova_alignment(), dwv_gunyah_shared());
+    NativeAdrenoAbiBoFree release = {.handle = handle};
+    kern_return_t cleanup = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
+    if (cleanup == KERN_SUCCESS) {

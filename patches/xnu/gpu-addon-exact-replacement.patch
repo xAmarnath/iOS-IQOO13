@@ -1,0 +1,44 @@
+Set exact addon length and verify persisted vnode contents before success.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8380,13 +8380,16 @@
+ 	int error = vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx);
+ 	if (!error) {
+ 		int equal = native_gpu_addon_equal(vp, data, size, mode, ctx);
+-		vnode_close(vp, FREAD, ctx);
++		int read_close_error = vnode_close(vp, FREAD, ctx);
+ 		vp = NULLVP;
++		if (read_close_error) {
++			return read_close_error;
++		}
+ 		if (equal) {
+ 			return -1;
+ 		}
+ 	}
+-	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
++	error = vnode_open(path, O_CREAT | FREAD | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -8399,13 +8402,19 @@
+ 	if (!error) {
+ 		struct vnode_attr va;
+ 		VATTR_INIT(&va);
++		/* vnode_open is the KPI, not open(2): enforce the final length
++		 * explicitly, including replacement by a shorter signed cache. */
++		VATTR_SET(&va, va_data_size, size);
+ 		VATTR_SET(&va, va_mode, mode);
+ 		error = vnode_setattr(vp, &va, ctx);
+ 	}
+ 	if (!error) {
+ 		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
+ 	}
+-	int close_error = vnode_close(vp, FWRITE, ctx);
++	if (!error && !native_gpu_addon_equal(vp, data, size, mode, ctx)) {
++		error = EIO;
++	}
++	int close_error = vnode_close(vp, FREAD | FWRITE, ctx);
+ 	return error ? error : close_error;
+ }
+ /* Creates the missing parent directories of an addon path with the mkdir syscall, /private/var/ngpu itself included (a Data seed

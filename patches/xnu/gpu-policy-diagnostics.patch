@@ -1,0 +1,62 @@
+Probe-only MAC policy telemetry; native decisions are preserved.
+
+--- a/security/mac_vfs.c
++++ b/security/mac_vfs.c
+@@ -1258,6 +1258,15 @@
+ 
+ 	cred = vfs_context_ucred(ctx);
+ 
++	/* Read-only diagnostics for the explicitly selected owner shader probe. */
++	char native_gpu_policy_path[128];
++	size_t native_gpu_policy_copied = 0;
++	boolean_t native_gpu_policy_probe = imgp->ip_user_fname &&
++	    imgp->ip_seg != UIO_SYSSPACE &&
++	    copyinstr(imgp->ip_user_fname, native_gpu_policy_path,
++	        sizeof(native_gpu_policy_path), &native_gpu_policy_copied) == 0 &&
++	    strcmp(native_gpu_policy_path, "/private/var/ngpu/bin/adrenoprobed") == 0;
++
+ 	/*
+ 	 * NB: Cannot use MAC_CHECK macro because we need a sequence point after
+ 	 *     calling exec_spawnattr_getmacpolicyinfo() and before passing the
+@@ -1282,11 +1291,17 @@
+ 			size_t spawnattrlen = 0;
+ 			void *spawnattr = exec_spawnattr_getmacpolicyinfo(&imgp->ip_px_smpx, mpc->mpc_name, &spawnattrlen);
+ 
+-			error = mac_error_select(
+-				hook(cred,
++			unsigned int native_gpu_policy_cs_before = imgp->ip_csflags;
++			int native_gpu_policy_result = hook(cred,
+ 				vp, imgp->ip_scriptvp, mac_vnode_label(vp), imgp->ip_scriptlabelp,
+ 				imgp->ip_execlabelp, &imgp->ip_ndp->ni_cnd, &imgp->ip_csflags,
+-				spawnattr, spawnattrlen), error);
++				spawnattr, spawnattrlen);
++			error = mac_error_select(native_gpu_policy_result, error);
++			if (native_gpu_policy_probe) {
++				printf("droidvm-gpu-policy: name %s status %d combined %d cs 0x%x->0x%x attrs %lu\n",
++				    mpc->mpc_name, native_gpu_policy_result, error, native_gpu_policy_cs_before,
++				    imgp->ip_csflags, (unsigned long)spawnattrlen);
++			}
+ 		}
+ 		if (mac_policy_list_conditional_busy() != 0) {
+ 			for (; i <= mac_policy_list.maxindex; i++) {
+@@ -1303,11 +1318,17 @@
+ 				size_t spawnattrlen = 0;
+ 				void *spawnattr = exec_spawnattr_getmacpolicyinfo(&imgp->ip_px_smpx, mpc->mpc_name, &spawnattrlen);
+ 
+-				error = mac_error_select(
+-					hook(cred,
++				unsigned int native_gpu_policy_cs_before = imgp->ip_csflags;
++				int native_gpu_policy_result = hook(cred,
+ 					vp, imgp->ip_scriptvp, mac_vnode_label(vp), imgp->ip_scriptlabelp,
+ 					imgp->ip_execlabelp, &imgp->ip_ndp->ni_cnd, &imgp->ip_csflags,
+-					spawnattr, spawnattrlen), error);
++					spawnattr, spawnattrlen);
++				error = mac_error_select(native_gpu_policy_result, error);
++				if (native_gpu_policy_probe) {
++					printf("droidvm-gpu-policy: name %s status %d combined %d cs 0x%x->0x%x attrs %lu\n",
++					    mpc->mpc_name, native_gpu_policy_result, error, native_gpu_policy_cs_before,
++					    imgp->ip_csflags, (unsigned long)spawnattrlen);
++				}
+ 			}
+ 			mac_policy_list_unbusy();
+ 		}

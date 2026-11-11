@@ -1,0 +1,56 @@
+# Local context and device records
+/AZ.md
+/archive-private/
+/.code-review-graph/
+**/run-*/
+**/recordings/
+*.log
+*-receipt.json
+*-device.json
+
+# Builds and toolchains
+**/build/
+**/out/
+**/__pycache__/
+*.pyc
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.apk
+*.dex
+*.class
+*.elf
+*.efi
+*.fd
+
+# Firmware, disks and proprietary inputs
+*.ipsw
+*.im4p
+*.img4
+*.img
+*.img.gz
+*.dmg
+*.qcow2
+*.raw
+*.vhdx
+*.iso
+*.zip
+*.tar
+*.tar.gz
+*.bin
+kernelcache*
+dyld_shared_cache*
+
+# Credentials and local settings
+.env
+.env.*
+*.pem
+*.key
+*.jks
+*.keystore
+local.properties
+.DS_Store
+Thumbs.db

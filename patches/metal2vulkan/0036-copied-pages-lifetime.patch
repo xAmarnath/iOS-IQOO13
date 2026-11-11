@@ -1,0 +1,198 @@
+diff --git a/crates/metal2vulkan-runtime/src/copied.rs b/crates/metal2vulkan-runtime/src/copied.rs
+--- a/crates/metal2vulkan-runtime/src/copied.rs
++++ b/crates/metal2vulkan-runtime/src/copied.rs
+@@ -3,7 +3,8 @@
+ //! the device admitted and that then failed (out of memory, another Vulkan error), is made all the
+ //! same over a copy of its bytes (`Device::buffer_over_host_memory`), as is a new buffer or
+ //! heap on a device without a host-page importer. These paths are announced
+-//! (`copied-host-pages`). No import maps the pages, so they take no kernel mapping.
++//! (`copied-host-pages`). On Darwin, an owned shared CPU alias retains the original pages even
++//! when CoreAnimation unmaps/replaces the caller address; no native GPU page import is needed.
+ //!
+ //! - **The copy.** A `VkBuffer` of the buffer's length in host-visible, coherent memory of the
+ //!   runtime's own ([`MemoryClass::Shared`](crate::memory::MemoryClass)), which the GPU uses; the
+@@ -60,7 +61,7 @@
+ /// Why a copy was not made ([`CopiedBuffers::add`]).
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub(crate) enum NotCopied {
+-    /// A page is not mapped, or mapped without read permission: memory Metal makes no buffer over.
++    /// A page is unreadable, or Darwin cannot retain a shared read/write mapping for sync.
+     Unreadable,
+     /// The host has no memory for the copy's snapshot.
+     OutOfHostMemory,
+@@ -69,16 +70,18 @@
+ /// A copy and the caller's pages it mirrors.
+ struct Entry {
+     id: u64,
+-    /// The caller's bytes (the buffer's `contents`).
++    /// Original pages: an owned alias on Darwin, the caller mapping elsewhere.
+     pages: NonNull<u8>,
++    #[cfg(any(target_os = "macos", target_os = "ios"))]
++    _retained: super::copied_pages::Pages,
+     /// The copy's bytes, mapped.
+     copy: NonNull<u8>,
+     /// The bytes the pages and the copy last agreed on.
+     snapshot: Box<[u8]>,
+ }
+ 
+-// SAFETY: the pointers name the caller's pages, which stay mapped while the buffer's import lives
+-// (`HostMemory::new`), and the copy's mapped memory, which the import holds; both are reached only
++// SAFETY: Darwin entries own an alias of the original pages; elsewhere `HostMemory::new`
++// requires the caller mapping to outlive the import. The import holds the copy. Both are reached only
+ // under the registry's lock, which the import's drop takes before either goes ([`Copied`]).
+ unsafe impl Send for Entry {}
+ 
+@@ -108,14 +111,18 @@
+     /// # Safety
+     ///
+     /// `copy` is `length` bytes of mapped memory nothing else uses yet, which stays mapped until
+-    /// the answer is dropped; `pages` the caller's bytes, which stay mapped as long
+-    /// (`HostMemory::new`).
++    /// the answer is dropped. `pages` stays mapped during this call; outside Darwin it must
++    /// stay mapped until the answer is dropped (`HostMemory::new`). Darwin retains an alias.
+     pub(crate) unsafe fn add(
+         self: &Arc<Self>,
+         pages: NonNull<u8>,
+         copy: NonNull<u8>,
+         length: usize,
+     ) -> Result<Copied, NotCopied> {
++        #[cfg(any(target_os = "macos", target_os = "ios"))]
++        let retained = super::copied_pages::Pages::retain(pages, length)?;
++        #[cfg(any(target_os = "macos", target_os = "ios"))]
++        let pages = retained.pointer();
+         let mut snapshot = Vec::new();
+         if snapshot.try_reserve_exact(length).is_err() {
+             return Err(NotCopied::OutOfHostMemory);
+@@ -131,6 +138,8 @@
+         lock(&self.entries).push(Entry {
+             id,
+             pages,
++            #[cfg(any(target_os = "macos", target_os = "ios"))]
++            _retained: retained,
+             copy,
+             snapshot,
+         });
+diff --git a/crates/metal2vulkan-runtime/src/copied_pages.rs b/crates/metal2vulkan-runtime/src/copied_pages.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/copied_pages.rs
+@@ -0,0 +1,107 @@
++//! An owned, shared CPU alias for Darwin copied imports. CoreAnimation can unmap the original
++//! address while a cached Metal buffer is still live; native imports retain the original pages.
++//! Keep the same page identity here, without changing the public `Buffer::contents` pointer.
++
++use super::copied::NotCopied;
++use std::ptr::NonNull;
++
++unsafe extern "C" {
++    static mach_task_self_: u32;
++    fn getpagesize() -> i32;
++    fn mach_vm_remap(
++        target_task: u32,
++        target_address: *mut u64,
++        size: u64,
++        mask: u64,
++        flags: i32,
++        source_task: u32,
++        source_address: u64,
++        copy: i32,
++        current: *mut i32,
++        maximum: *mut i32,
++        inheritance: u32,
++    ) -> i32;
++    fn mach_vm_deallocate(task: u32, address: u64, size: u64) -> i32;
++}
++
++/// Owns only the new mapping. It neither deallocates nor changes the caller's virtual address.
++pub(crate) struct Pages {
++    base: u64,
++    length: u64,
++    pointer: NonNull<u8>,
++}
++
++impl Pages {
++    /// Retain the VM objects containing these bytes with a shared (not copy-on-write) alias.
++    /// The kernel validates the range; a failed/readonly mapping is never registered for sync.
++    pub(crate) fn retain(pointer: NonNull<u8>, length: usize) -> Result<Self, NotCopied> {
++        // SAFETY: queries the current process's page size without dereferencing caller memory.
++        let page = usize::try_from(unsafe { getpagesize() })
++            .ok()
++            .filter(|page| page.is_power_of_two())
++            .ok_or(NotCopied::Unreadable)?;
++        let source = pointer.as_ptr() as usize;
++        let start = source & !(page - 1);
++        let end = source
++            .checked_add(length)
++            .and_then(|end| end.checked_next_multiple_of(page))
++            .filter(|end| length != 0 && *end > start)
++            .ok_or(NotCopied::Unreadable)?;
++        let size = (end - start) as u64;
++        let mut base = 0;
++        let (mut current, mut maximum) = (0, 0);
++        // mach/vm_statistics.h: ANYWHERE=1; vm_inherit.h: NONE=2; copy=false shares VM objects.
++        // SAFETY: kernel-chosen destination; the kernel validates every source mapping. Output
++        // protections start at VM_PROT_NONE as required by the legacy mach_vm_remap interface.
++        let result = unsafe {
++            mach_vm_remap(
++                mach_task_self_,
++                &mut base,
++                size,
++                0,
++                1,
++                mach_task_self_,
++                start as u64,
++                0,
++                &mut current,
++                &mut maximum,
++                2,
++            )
++        };
++        if result != 0 {
++            return Err(match result {
++                3 | 6 => NotCopied::OutOfHostMemory, // KERN_NO_SPACE / KERN_RESOURCE_SHORTAGE
++                _ => NotCopied::Unreadable,
++            });
++        }
++        // Install ownership before validating outputs so every successful remap is released.
++        let mut pages = Self {
++            base,
++            length: size,
++            pointer,
++        };
++        // Sync reads and writes the alias. Do not elevate protections or silently drop writes.
++        if current & 3 != 3 {
++            // VM_PROT_READ | VM_PROT_WRITE
++            return Err(NotCopied::Unreadable);
++        }
++        let address = base
++            .checked_add((source - start) as u64)
++            .ok_or(NotCopied::Unreadable)?;
++        pages.pointer = NonNull::new(address as *mut u8).ok_or(NotCopied::Unreadable)?;
++        Ok(pages)
++    }
++
++    pub(crate) fn pointer(&self) -> NonNull<u8> {
++        self.pointer
++    }
++}
++
++impl Drop for Pages {
++    fn drop(&mut self) {
++        // SAFETY: precisely the new alias returned by remap, never the caller's source mapping.
++        unsafe {
++            mach_vm_deallocate(mach_task_self_, self.base, self.length);
++        }
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -59,6 +59,8 @@
+ mod compute;
+ mod contexts;
+ mod copied;
++#[cfg(any(target_os = "macos", target_os = "ios"))]
++mod copied_pages;
+ mod copy_plan;
+ mod creation;
+ mod deferred;

@@ -1,0 +1,16 @@
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -574,6 +574,12 @@
+       cs->start = cs->cur = cs->reserved_end = (uint32_t *) cs->read_only.bos[0]->map;
+       cs->end = cs->start + tu_sanitize_ib_size(cs->read_only.bos[0]->size /
+                                                 sizeof(uint32_t));
++   } else {
++      /* A failed first BO allocation leaves cur/reserved_end in the OOM sink.
++       * Resetting status alone would make those bytes look like a valid IB,
++       * despite this stream owning no BO. Recreate the empty initial state.
++       */
++      cs->start = cs->cur = cs->reserved_end = cs->end = NULL;
+    }
+ 
+    if (cs->read_write.bo_count) {

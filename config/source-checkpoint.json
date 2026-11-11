@@ -1,0 +1,17 @@
+{
+  "checkpoint_date": "2026-11-11",
+  "private_ram_mib": 2048,
+  "vcpus": 2,
+  "shared_gpu_pool_mib": 1536,
+  "data_gib": 6,
+  "standalone_gpu_checks": 1732,
+  "full_vm_result": "Gunyah address-space mapping returned ENOMEM; owner retained for recovery",
+  "mapping_address": "0x216997000",
+  "elapsed_seconds_at_mapping_error": 133.217,
+  "profile_change_contract": [
+    "monitor",
+    "guest driver and allocator",
+    "device tree",
+    "package validation"
+  ]
+}

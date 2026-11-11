@@ -1,0 +1,557 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin_virtgpu.cc b/src/freedreno/vulkan/tu_knl_darwin_virtgpu.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin_virtgpu.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin_virtgpu.cc
+@@ -8,6 +8,8 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <limits.h>
++#include <libkern/OSCacheControl.h>
+ #include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -32,6 +34,11 @@
+    DWV_CCMD_IOCTL_SIMPLE = 2,
+    DWV_CCMD_GEM_NEW = 3,
+    DWV_CCMD_GEM_SUBMIT = 7,
++   DWV_CCMD_WAIT_FENCE = 10,
++   DWV_SHARED_PAGE = 16384,
++   DWV_SHARED_POOL = 32u << 20,
++   DWV_SHARED_COMMANDS = 64, /* IB batch limit; independent of live BO count */
++   DWV_SHARED_SUBMIT_FLAGS = 0x82000010u, /* 3D0 | FENCE_SN_IN | NO_IMPLICIT */
+    DWV_MSM_GET_PARAM = 0xc0186440,       /* DRM_IOCTL_MSM_GET_PARAM */
+    DWV_MSM_SUBMITQUEUE_NEW = 0xc00c644a, /* DRM_IOCTL_MSM_SUBMITQUEUE_NEW */
+    DWV_MSM_SUBMITQUEUE_CLOSE = 0x4004644b, /* DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE */
+@@ -64,6 +71,7 @@
+ struct dwv_bo {
+    bool used;
+    uint64_t size, iova;
++   void *cpu_address; /* shared BO alias, retained until GEM_CLOSE */
+    uint64_t user_address;   /* BoImport: the caller's pages the blob is made of */
+    uint32_t kernel_handle, resource_id;
+    uint32_t metadata_bytes;
+@@ -78,6 +86,8 @@
+    uint32_t shmem_handle, seqno;
+    uint32_t queue_id, ring, submit_fence, priority, queue_flags;
+    uint64_t next_blob_id;
++   uint32_t completed_fence;
++   bool failed;
+    struct dwv_bo *bos;
+    uint32_t bo_capacity;
+    struct dwv_capset caps;
+@@ -126,6 +136,26 @@
+    return dwv_board_default();
+ }
+ 
++/* Opt in only on the SHARE-backed Gunyah transport. Private LEND pages
++ * cannot be imported and generic virtio fences are not GPU completion. */
++bool
++dwv_gunyah_shared(void)
++{
++   static const bool enabled = []() {
++      const char *value = getenv("TU_DARWIN_GUNYAH_SHARED");
++      return value && strcmp(value, "1") == 0;
++   }();
++   return enabled;
++}
++
++static kern_return_t
++dwv_cache(void *address, size_t size)
++{
++   if (!address || !size || sys_cache_control(kCacheFunctionFlushDcache, address, size))
++      return kIOReturnError;
++   return KERN_SUCCESS;
++}
++
+ static kern_return_t
+ vg_call(uint32_t op, const void *in, size_t in_size, void *out, size_t out_size)
+ {
+@@ -142,7 +172,26 @@
+                                                 out_size ? &out_bytes : NULL);
+    if (buffer != stack)
+       free(buffer);
++   if (kr == KERN_SUCCESS && out_bytes != out_size)
++      return kIOReturnUnderrun;
+    return kr;
++}
++
++/* A command ACK is synchronous on the shared transport. Validate both the
++ * response arena and the native sequence; a stale/forged response is fatal.
++ * The public cache syscall is checked, never replaced with a no-op. */
++static kern_return_t
++dwv_shared_header(uint32_t *offset)
++{
++   kern_return_t kr = dwv_cache((void *)dwv.shmem, DWV_SHMEM_BYTES);
++   if (kr != KERN_SUCCESS)
++      return kr;
++   *offset = *(volatile uint32_t *)(dwv.shmem + 4);
++   if (*offset < 16 || *offset > DWV_SHMEM_BYTES - 32 || (*offset & 3))
++      return kIOReturnBadArgument;
++   if (*(volatile uint32_t *)(dwv.shmem + 8) || *(volatile uint32_t *)(dwv.shmem + 12))
++      return kIOReturnError;
++   return KERN_SUCCESS;
+ }
+ 
+ /* One ccmd through EXECBUFFER (no fence), its response in the shmem: the response's length is written first (the host copies back
+@@ -150,6 +199,18 @@
+ static kern_return_t
+ vg_ccmd(void *request, uint32_t size, uint32_t response_bytes)
+ {
++   const bool shared = dwv_gunyah_shared();
++   if (size < 16 || size > DROIDVM_VIRTGPU_MAX_COMMAND || (size & 3) ||
++       !dwv.shmem || dwv.seqno == UINT32_MAX || (shared && dwv.failed))
++      return kIOReturnBadArgument;
++   uint32_t arena = 0;
++   if (shared) {
++      kern_return_t checked = dwv_shared_header(&arena);
++      if (checked != KERN_SUCCESS || response_bytes > DWV_SHMEM_BYTES - arena) {
++         dwv.failed = true;
++         return checked == KERN_SUCCESS ? kIOReturnBadArgument : checked;
++      }
++   }
+    uint32_t *header = (uint32_t *)request; /* vdrm_ccmd_req: cmd, len, seqno, rsp_off */
+    header[1] = size;
+    header[2] = ++dwv.seqno;
+@@ -157,6 +218,10 @@
+    const uint32_t response_offset = *(volatile uint32_t *)(dwv.shmem + 4);
+    if (response_bytes)
+       *(volatile uint32_t *)(dwv.shmem + response_offset) = response_bytes;
++   if (shared && dwv_cache((void *)dwv.shmem, DWV_SHMEM_BYTES) != KERN_SUCCESS) {
++      dwv.failed = true;
++      return kIOReturnError;
++   }
+    uint8_t stack[512];
+    const size_t total = sizeof(struct droidvm_virtgpu_execbuffer) + size;
+    uint8_t *exec = total <= sizeof(stack) ? stack : (uint8_t *)malloc(total);
+@@ -169,6 +234,17 @@
+    kern_return_t kr = vg_call(DROIDVM_VIRTGPU_EXECBUFFER, exec, total, &reply, sizeof(reply));
+    if (exec != stack)
+       free(exec);
++   if (shared) {
++      uint32_t after = 0;
++      if (kr == KERN_SUCCESS)
++         kr = dwv_shared_header(&after);
++      if (kr == KERN_SUCCESS && (after != arena || *(volatile uint32_t *)dwv.shmem != dwv.seqno ||
++          (response_bytes && *(volatile uint32_t *)(dwv.shmem + after) != response_bytes)))
++         kr = kIOReturnError;
++      if (kr != KERN_SUCCESS)
++         dwv.failed = true;
++      return kr;
++   }
+    /* The host answers in the same command's processing; this rarely spins at all. */
+    for (unsigned i = 0; kr == KERN_SUCCESS && *(volatile uint32_t *)dwv.shmem < dwv.seqno; i++) {
+       if (i > 100000)
+@@ -190,17 +266,21 @@
+ static kern_return_t
+ vg_ioctl_simple(uint32_t ioctl, void *payload, uint32_t payload_bytes)
+ {
++   if (payload_bytes > 64)
++      return kIOReturnBadArgument;
+    uint8_t request[16 + 4 + 64] = {};
+    const uint32_t cmd = DWV_CCMD_IOCTL_SIMPLE;
+    memcpy(request, &cmd, 4);
+    memcpy(request + 16, &ioctl, 4);
+    memcpy(request + 20, payload, payload_bytes);
+-   kern_return_t kr = vg_ccmd(request, 20 + payload_bytes, 8 + payload_bytes);
++   const bool returns_payload = (ioctl & 0x80000000u) != 0; /* Linux IOC_READ */
++   kern_return_t kr = vg_ccmd(request, 20 + payload_bytes, 8 + (returns_payload ? payload_bytes : 0));
+    if (kr != KERN_SUCCESS)
+       return kr;
+    int32_t ret;
+    memcpy(&ret, (const void *)(vg_response() + 4), 4);
+-   memcpy(payload, (const void *)(vg_response() + 8), payload_bytes);
++   if (ret == 0 && returns_payload)
++      memcpy(payload, (const void *)(vg_response() + 8), payload_bytes);
+    return ret ? kIOReturnError : KERN_SUCCESS;
+ }
+ 
+@@ -230,6 +310,8 @@
+       kr = kIOReturnNotPermitted;
+ 
+    pthread_mutex_lock(&dwv.lock);
++   dwv.failed = false;
++   dwv.completed_fence = 0;
+    const struct droidvm_virtgpu_get_caps get_caps = {DWV_CAPSET_DRM, 0};
+    if (kr == KERN_SUCCESS)
+       kr = vg_call(DROIDVM_VIRTGPU_GET_CAPS, &get_caps, sizeof(get_caps), &dwv.caps, sizeof(dwv.caps));
+@@ -247,6 +329,8 @@
+    struct droidvm_virtgpu_map_reply map = {};
+    if (kr == KERN_SUCCESS)
+       kr = vg_call(DROIDVM_VIRTGPU_MAP, &handle, sizeof(handle), &map, sizeof(map));
++   if (kr == KERN_SUCCESS && (!map.address || map.size < DWV_SHMEM_BYTES))
++      kr = kIOReturnUnderrun;
+    if (kr == KERN_SUCCESS) {
+       dwv.shmem = (volatile uint8_t *)(uintptr_t)map.address;
+       dwv.shmem_handle = blob.handle;
+@@ -318,6 +402,8 @@
+ kern_return_t
+ dwv_set_deadline(void)
+ {
++   if (dwv_gunyah_shared())
++      return kIOReturnUnsupported;
+    kern_return_t kr = KERN_SUCCESS;
+    pthread_mutex_lock(&dwv.lock);
+    if (dwv.shmem && !(dwv.queue_flags & DWV_SUBMITQUEUE_DEADLINE) && !dwv.submit_fence) {
+@@ -393,8 +479,12 @@
+       struct droidvm_virtgpu_create_blob_user b;
+       struct gem_new ccmd;
+    } user = {};
++   if (dwv_gunyah_shared() && (bo->user_address || dwv.failed || dwv.seqno == UINT32_MAX ||
++       dwv.next_blob_id > UINT32_MAX))
++      return kIOReturnUnsupported;
+    const uint64_t blob_id = dwv.next_blob_id++;
+-   const uint32_t flags = DROIDVM_VIRTGPU_BLOB_FLAG_MAPPABLE | DROIDVM_VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE;
++   const uint32_t flags = DROIDVM_VIRTGPU_BLOB_FLAG_MAPPABLE |
++      (dwv_gunyah_shared() ? 0 : DROIDVM_VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE);
+    struct gem_new *ccmd = bo->user_address ? &user.ccmd : &request.ccmd;
+    ccmd->header[0] = DWV_CCMD_GEM_NEW;
+    ccmd->header[1] = sizeof(*ccmd);
+@@ -421,9 +511,174 @@
+    return KERN_SUCCESS;
+ }
+ 
++/* All calls below hold dwv.lock. Keep every bound BO alive through native
++ * completion, including texture/data BOs that do not appear in the IB list. */
++static kern_return_t
++dwv_map_locked(struct dwv_bo *bo)
++{
++   if (!bo || !bo->kernel_handle)
++      return kIOReturnBadArgument;
++   if (bo->cpu_address)
++      return KERN_SUCCESS;
++   const struct droidvm_virtgpu_handle request = {bo->kernel_handle, 0};
++   struct droidvm_virtgpu_map_reply reply = {};
++   kern_return_t kr = vg_call(DROIDVM_VIRTGPU_MAP, &request, sizeof(request), &reply, sizeof(reply));
++   if (kr == KERN_SUCCESS) {
++      if (!reply.address || reply.size != bo->size || reply.address > UINT64_MAX - reply.size)
++         return kIOReturnUnderrun;
++      bo->cpu_address = (void *)(uintptr_t)reply.address;
++   }
++   return kr;
++}
++
++static kern_return_t
++dwv_cache_bos(void)
++{
++   for (uint32_t h = 1; h < dwv.bo_capacity; h++) {
++      struct dwv_bo *bo = &dwv.bos[h];
++      if (!bo->used || !bo->resource_id)
++         continue;
++      kern_return_t kr = dwv_map_locked(bo);
++      if (kr == KERN_SUCCESS)
++         kr = dwv_cache(bo->cpu_address, bo->size);
++      if (kr != KERN_SUCCESS)
++         return kr;
++   }
++   return KERN_SUCCESS;
++}
++
++static kern_return_t
++dwv_native_wait(uint64_t fence, uint64_t timeout_ns)
++{
++   if (!fence || fence > dwv.submit_fence || fence > INT32_MAX - 1u)
++      return kIOReturnBadArgument;
++   if (dwv.failed)
++      return kIOReturnError;
++   if (fence <= dwv.completed_fence)
++      return KERN_SUCCESS;
++   const uint64_t start = os_time_get_nano();
++   for (;;) {
++      struct { uint32_t header[4], queue, fence; } request =
++         {{DWV_CCMD_WAIT_FENCE, 0, 0, 0}, dwv.queue_id, (uint32_t)fence};
++      kern_return_t kr = vg_ccmd(&request, sizeof(request), 8);
++      if (kr != KERN_SUCCESS)
++         return kr;
++      int32_t status;
++      memcpy(&status, (const void *)(vg_response() + 4), sizeof(status));
++      if (!status) {
++         dwv.completed_fence = (uint32_t)fence;
++         kr = dwv_cache_bos();
++         if (kr != KERN_SUCCESS)
++            dwv.failed = true;
++         return kr;
++      }
++      /* These are Linux wire errno values, not Darwin errno numbers. */
++      if (status != -110 && status != -35) {
++         os_log_error(OS_LOG_DEFAULT, "dwv: native fence %llu failed: %d", (unsigned long long)fence, status);
++         dwv.failed = true;
++         return kIOReturnError;
++      }
++      if (!timeout_ns || (uint64_t)os_time_get_nano() - start >= timeout_ns)
++         return kIOReturnTimeout;
++      usleep(50);
++   }
++}
++
++static kern_return_t
++dwv_shared_submit(const NativeAdrenoAbiSubmit *req, NativeAdrenoAbiSubmitReply *reply)
++{
++   if (req->reserved || req->queue > 1 || !req->buffer_count || req->buffer_count > DWV_SHARED_COMMANDS)
++      return kIOReturnBadArgument;
++   if (dwv.failed)
++      return kIOReturnError;
++   if (dwv.submit_fence == INT32_MAX - 1u)
++      return kIOReturnNoResources;
++   if (req->wait_fence) {
++      kern_return_t kr = dwv_native_wait(req->wait_fence, req->wait_timeout_ns);
++      if (kr != KERN_SUCCESS)
++         return kr;
++   }
++   struct submit_bo { uint32_t flags, handle; uint64_t presumed; };
++   struct submit_cmd { uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs; uint64_t relocs; }
++      cmds[DWV_SHARED_COMMANDS] = {};
++   static_assert(sizeof(submit_bo) == 16 && sizeof(submit_cmd) == 32, "native submit wire sizes");
++   const uint32_t cmds_bytes = req->buffer_count * sizeof(cmds[0]);
++   /* Every live BO is referenced. Reserve command bytes first: the unchanged
++    * 64 KiB wire fits 4091 BOs with one IB, or 3965 with a full 64-IB batch. */
++   const uint32_t max_bos = (DROIDVM_VIRTGPU_MAX_COMMAND - 36 - cmds_bytes) / sizeof(submit_bo);
++   uint32_t nr_bos = 0;
++   for (uint32_t h = 1; h < dwv.bo_capacity; h++) {
++      const struct dwv_bo *bo = &dwv.bos[h];
++      if (!bo->used || !bo->resource_id)
++         continue;
++      if (nr_bos == max_bos) {
++         os_log_error(OS_LOG_DEFAULT, "dwv: submit BO list exceeds wire capacity %u (IBs %u)",
++                      max_bos, req->buffer_count);
++         return kIOReturnNoResources;
++      }
++      ++nr_bos;
++   }
++   for (uint32_t i = 0; i < req->buffer_count; i++) {
++      const NativeAdrenoAbiSubmitBuffer *ib = &req->buffers[i];
++      const struct dwv_bo *bo = dwv_lookup(ib->handle);
++      if (!bo || !bo->resource_id || ib->iova < bo->iova || !ib->bytes ||
++          ((ib->iova | ib->bytes) & 3) || ib->bytes > UINT32_MAX)
++         return kIOReturnBadArgument;
++      const uint64_t offset = ib->iova - bo->iova;
++      if (offset > UINT32_MAX || offset > bo->size || ib->bytes > bo->size - offset)
++         return kIOReturnBadArgument;
++      cmds[i] = {DWV_MSM_SUBMIT_CMD_BUF, UINT32_MAX, (uint32_t)offset, (uint32_t)ib->bytes, 0, 0, 0};
++   }
++   kern_return_t kr = dwv_cache_bos();
++   if (kr != KERN_SUCCESS)
++      return kr; /* nothing has been submitted */
++   const uint32_t head[9] = {DWV_CCMD_GEM_SUBMIT, 0, 0, 0, DWV_SHARED_SUBMIT_FLAGS, dwv.queue_id,
++                             nr_bos, req->buffer_count, dwv.submit_fence + 1};
++   const uint32_t bos_bytes = nr_bos * sizeof(submit_bo);
++   const uint32_t packed_bytes = sizeof(head) + bos_bytes + cmds_bytes;
++   /* Avoid a 64 KiB automatic array on compositor threads. */
++   uint32_t *packed = (uint32_t *)malloc(packed_bytes);
++   if (!packed)
++      return kIOReturnNoMemory;
++   memcpy(packed, head, sizeof(head));
++   uint32_t index = 0;
++   for (uint32_t h = 1; h < dwv.bo_capacity; h++) {
++      const struct dwv_bo *bo = &dwv.bos[h];
++      if (!bo->used || !bo->resource_id)
++         continue;
++      const submit_bo entry = {DWV_MSM_SUBMIT_BO_READ | DWV_MSM_SUBMIT_BO_WRITE, bo->resource_id, bo->iova};
++      /* Wire entries begin at byte36 and need not be uint64_t-aligned. */
++      memcpy((uint8_t *)packed + sizeof(head) + index * sizeof(entry), &entry, sizeof(entry));
++      for (uint32_t i = 0; i < req->buffer_count; i++)
++         if (req->buffers[i].handle == h)
++            cmds[i].submit_idx = index;
++      ++index;
++   }
++   for (uint32_t i = 0; i < req->buffer_count; i++) {
++      if (cmds[i].submit_idx == UINT32_MAX) {
++         free(packed);
++         return kIOReturnBadArgument;
++      }
++   }
++   memcpy((uint8_t *)packed + sizeof(head) + bos_bytes, cmds, cmds_bytes);
++   ++dwv.submit_fence;
++   kr = vg_ccmd(packed, packed_bytes, 0);
++   free(packed);
++   if (kr == KERN_SUCCESS)
++      kr = dwv_native_wait(dwv.submit_fence, 5000000000ull);
++   if (kr != KERN_SUCCESS) {
++      dwv.failed = true; /* retain uncertain backing; never turn timeout into success */
++      return kr;
++   }
++   reply->fence = dwv.completed_fence;
++   return KERN_SUCCESS;
++}
++
+ static kern_return_t
+ dwv_submit(const NativeAdrenoAbiSubmit *req, NativeAdrenoAbiSubmitReply *reply)
+ {
++   if (dwv_gunyah_shared())
++      return dwv_shared_submit(req, reply);
+    if (!req->buffer_count || req->buffer_count > NativeAdrenoAbiMaxBuffers)
+       return kIOReturnBadArgument;
+    struct submit_bo { uint32_t flags, handle; uint64_t presumed; };
+@@ -485,17 +740,13 @@
+ dwv_map(uint64_t handle, void **address, uint64_t *bytes)
+ {
+    pthread_mutex_lock(&dwv.lock);
+-   const struct dwv_bo *bo = dwv_lookup(handle);
+-   const struct droidvm_virtgpu_handle request = {bo ? bo->kernel_handle : 0, 0};
++   struct dwv_bo *bo = dwv_lookup(handle);
++   kern_return_t kr = dwv_map_locked(bo);
++   if (kr == KERN_SUCCESS) {
++      *address = bo->cpu_address;
++      *bytes = bo->size;
++   }
+    pthread_mutex_unlock(&dwv.lock);
+-   if (!bo || !request.handle)
+-      return kIOReturnBadArgument;
+-   struct droidvm_virtgpu_map_reply reply = {};
+-   kern_return_t kr = vg_call(DROIDVM_VIRTGPU_MAP, &request, sizeof(request), &reply, sizeof(reply));
+-   if (kr == KERN_SUCCESS) {
+-      *address = (void *)(uintptr_t)reply.address;
+-      *bytes = reply.size;
+-   }
+    return kr;
+ }
+ 
+@@ -538,6 +789,10 @@
+       NativeAdrenoAbiParams *params = (NativeAdrenoAbiParams *)out;
+       *params = (NativeAdrenoAbiParams){NativeAdrenoAbiVersion, 48, 48, NativeAdrenoParamsHostImport,
+                                         1ull << NativeAdrenoAbiMaxBoBytesShift};
++      if (dwv_gunyah_shared()) {
++         params->flags = 0; /* private user pages cannot become SHARE BOs */
++         params->max_bo_bytes = DWV_SHARED_POOL;
++      }
+       return KERN_SUCCESS;
+    }
+    case NativeAdrenoMethodGetDeviceInfo: {
+@@ -564,6 +819,8 @@
+       return KERN_SUCCESS;
+    }
+    case NativeAdrenoMethodGetTimestamp: {
++      if (dwv_gunyah_shared())
++         return kIOReturnUnsupported; /* no fabricated GPU timestamp */
+       if (out_size != sizeof(NativeAdrenoAbiTimestamp))
+          return kIOReturnBadArgument;
+       /* drm2kgsl has no GPU timestamp to give; the always-on counter runs at 19.2 MHz, and this is where it would be. */
+@@ -573,6 +830,17 @@
+    case NativeAdrenoMethodGetStatus: {
+       if (out_size != sizeof(NativeAdrenoAbiStatus) || !dwv.shmem)
+          return kIOReturnBadArgument;
++      if (dwv_gunyah_shared()) {
++         pthread_mutex_lock(&dwv.lock);
++         uint32_t offset = 0;
++         kr = dwv_shared_header(&offset);
++         const bool failed = dwv.failed;
++         pthread_mutex_unlock(&dwv.lock);
++         if (kr != KERN_SUCCESS)
++            return kr;
++         *(NativeAdrenoAbiStatus *)out = (NativeAdrenoAbiStatus){failed ? 1ull : 0ull, 0};
++         return KERN_SUCCESS;
++      }
+       /* msm_shmem's async_error (a submission the host refused) and global_faults, when the host's shmem has them. */
+       const uint32_t fields = *(volatile uint32_t *)(dwv.shmem + 4);
+       const uint64_t faults = (fields > 8 ? *(volatile uint32_t *)(dwv.shmem + 8) : 0) +
+@@ -584,6 +852,12 @@
+       if (in_size != sizeof(NativeAdrenoAbiWaitFence))
+          return kIOReturnBadArgument;
+       const NativeAdrenoAbiWaitFence *req = (const NativeAdrenoAbiWaitFence *)in;
++      if (dwv_gunyah_shared()) {
++         pthread_mutex_lock(&dwv.lock);
++         kr = dwv_native_wait(req->fence, req->timeout_ns);
++         pthread_mutex_unlock(&dwv.lock);
++         return kr;
++      }
+       const struct droidvm_virtgpu_wait_fence wait = {dwv.ring, 0, req->fence, req->timeout_ns};
+       return vg_call(DROIDVM_VIRTGPU_WAIT_FENCE, &wait, sizeof(wait), NULL, 0);
+    }
+@@ -605,7 +879,9 @@
+    case NativeAdrenoMethodBoAlloc: {
+       const NativeAdrenoAbiBoAlloc *req = (const NativeAdrenoAbiBoAlloc *)in;
+       if (in_size != sizeof(*req) || out_size != sizeof(NativeAdrenoAbiBoAllocReply) || !req->bytes ||
+-          (req->bytes & 4095) || req->bytes > (1ull << NativeAdrenoAbiMaxBoBytesShift)) {
++          (req->bytes & (dwv_gunyah_shared() ? DWV_SHARED_PAGE - 1 : 4095)) ||
++          req->bytes > (dwv_gunyah_shared() ? DWV_SHARED_POOL : (1ull << NativeAdrenoAbiMaxBoBytesShift)) ||
++          (dwv_gunyah_shared() && (req->contiguous || req->align_log2 != 14))) {
+          kr = kIOReturnBadArgument;
+          break;
+       }
+@@ -619,6 +895,10 @@
+       break;
+    }
+    case NativeAdrenoMethodBoImport: {
++      if (dwv_gunyah_shared()) {
++         kr = kIOReturnUnsupported;
++         break;
++      }
+       const NativeAdrenoAbiBoImport *req = (const NativeAdrenoAbiBoImport *)in;
+       if (in_size != sizeof(*req) || out_size != sizeof(NativeAdrenoAbiBoAllocReply) || !req->address || !req->bytes ||
+           ((req->address | req->bytes) & 4095) || req->bytes > (1ull << NativeAdrenoAbiMaxBoBytesShift)) {
+@@ -637,8 +917,10 @@
+    case NativeAdrenoMethodBoMap: {
+       const NativeAdrenoAbiBoMap *req = (const NativeAdrenoAbiBoMap *)in;
+       struct dwv_bo *bo = in_size == sizeof(*req) ? dwv_lookup(req->handle) : NULL;
+-      if (!bo || bo->resource_id || out_size != sizeof(NativeAdrenoAbiBoMapReply) || (req->iova & 4095) ||
+-          req->iova < dwv.va_start || req->iova + bo->size > dwv.va_start + dwv.va_size) {
++      if (!bo || bo->resource_id || out_size != sizeof(NativeAdrenoAbiBoMapReply) ||
++          (req->iova & (dwv_gunyah_shared() ? DWV_SHARED_PAGE - 1 : 4095)) ||
++          req->iova < dwv.va_start || req->iova - dwv.va_start > dwv.va_size ||
++          bo->size > dwv.va_size - (req->iova - dwv.va_start)) {
+          kr = bo && bo->resource_id ? kIOReturnBusy : kIOReturnBadArgument;
+          break;
+       }
+@@ -652,6 +934,10 @@
+       struct dwv_bo *bo = in_size == sizeof(*req) ? dwv_lookup(req->handle) : NULL;
+       if (!bo) {
+          kr = kIOReturnBadArgument;
++         break;
++      }
++      if (dwv_gunyah_shared() && dwv.completed_fence < dwv.submit_fence) {
++         kr = kIOReturnBusy; /* the native queue may still own these pages */
+          break;
+       }
+       if (bo->kernel_handle) {
+diff --git a/src/freedreno/vulkan/tu_knl_darwin_virtgpu.h b/src/freedreno/vulkan/tu_knl_darwin_virtgpu.h
+--- a/src/freedreno/vulkan/tu_knl_darwin_virtgpu.h
++++ b/src/freedreno/vulkan/tu_knl_darwin_virtgpu.h
+@@ -13,6 +13,8 @@
+ 
+ /* TU_DARWIN_VIRTGPU=1 */
+ bool dwv_enabled(void);
++/* Explicit opt-in for the bounded Gunyah SHARE transport. */
++bool dwv_gunyah_shared(void);
+ /* The DRM context, its msm shmem and its submit queue; closing the connection ends them all. */
+ kern_return_t dwv_open(void);
+ uint32_t dwv_priorities(void);
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -873,10 +873,15 @@
+ 
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    /* TU_DARWIN_BO_CACHE=0 turns the cache off (the host checks of the release paths need every free to reach the kernel). */
+-   static const bool cache_enabled = debug_get_bool_option("TU_DARWIN_BO_CACHE", true);
++   static const bool cache_enabled = debug_get_bool_option("TU_DARWIN_BO_CACHE", !dwv_gunyah_shared());
+    const bool cacheable = cache_enabled && !(flags & TU_BO_ALLOC_REPLAYABLE) && !lazy_vma;
+    const bool read_only = !!(flags & TU_BO_ALLOC_GPU_READ_ONLY);
+    uint64_t alloc_size = cacheable ? darwin_size_class(size) : size;
++   if (dwv_gunyah_shared()) {
++      if (!alloc_size || alloc_size > (32u << 20))
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      alloc_size = (alloc_size + 16383) & ~16383ull;
++   }
+ 
+    uint64_t iova = 0, handle = 0;
+    void *cached_mapping = NULL;
+@@ -916,7 +921,7 @@
+       if (result != VK_SUCCESS)
+          return result;
+ 
+-      NativeAdrenoAbiBoAlloc alloc = {.bytes = alloc_size, .align_log2 = 12, .contiguous = 0};
++      NativeAdrenoAbiBoAlloc alloc = {.bytes = alloc_size, .align_log2 = dwv_gunyah_shared() ? 14u : 12u, .contiguous = 0};
+       NativeAdrenoAbiBoAllocReply reply = {};
+       kern_return_t kr = dw_call(NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+       if (kr != KERN_SUCCESS) {
+@@ -1471,8 +1476,9 @@
+    if (total) {
+       const NativeAdrenoAbiSubmitBuffer *all =
+          util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
+-      for (unsigned at = 0; at < total; at += NativeAdrenoAbiMaxBuffers) {
+-         unsigned count = MIN2(total - at, (unsigned)NativeAdrenoAbiMaxBuffers);
++      const unsigned max_buffers = dwv_gunyah_shared() ? 64u : (unsigned)NativeAdrenoAbiMaxBuffers;
++      for (unsigned at = 0; at < total; at += max_buffers) {
++         unsigned count = MIN2(total - at, max_buffers);
+          uint32_t chunk_fence = 0;
+          VkResult result = darwin_submit_chunk(queue, all + at, count, &chunk_fence);
+          if (result != VK_SUCCESS)

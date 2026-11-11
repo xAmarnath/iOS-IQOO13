@@ -1,0 +1,433 @@
+Probe-only execution diagnostics; native errors and checks are unchanged.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1920,6 +1920,26 @@
+  *		activators should not be given the opportunity to attempt
+  *		to activate the image.
+  */
++/* Owner shader probe diagnostics only. Retain all native checks/results.
++ * copyinstr also covers failures before namei, without dereferencing user
++ * pointers or allocating memory. No filename or credentials are modified. */
++static void
++native_gpu_exec_trace(struct image_params *imgp, const char *stage, int status, int line)
++{
++	char path[128];
++	size_t copied = 0;
++	if (!imgp || !imgp->ip_user_fname || imgp->ip_seg == UIO_SYSSPACE) {
++		return;
++	}
++	if (copyinstr(imgp->ip_user_fname, path, sizeof(path), &copied) != 0 ||
++	    strcmp(path, "/private/var/ngpu/bin/adrenoprobed") != 0) {
++		return;
++	}
++	printf("droidvm-gpu-exec: pid %d stage %s line %d status %d flags 0x%x mac %d cs 0x%x\n",
++	    proc_getpid(current_proc()), stage, line, status, imgp->ip_flags,
++	    imgp->ip_mac_return, imgp->ip_csflags);
++}
++
+ static int
+ exec_mach_imgact(struct image_params *imgp)
+ {
+@@ -1952,17 +1972,20 @@
+ 	if ((mach_header->magic == MH_CIGAM) ||
+ 	    (mach_header->magic == MH_CIGAM_64)) {
+ 		error = EBADARCH;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 
+ 	if ((mach_header->magic != MH_MAGIC) &&
+ 	    (mach_header->magic != MH_MAGIC_64)) {
+ 		error = -1;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 
+ 	if (mach_header->filetype != MH_EXECUTE) {
+ 		error = -1;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 
+@@ -1971,6 +1994,7 @@
+ 		if (imgp->ip_origcputype != mach_header->cputype ||
+ 		    imgp->ip_origcpusubtype != mach_header->cpusubtype) {
+ 			error = EBADARCH;
++			native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 			goto bad;
+ 		}
+ 	} else {
+@@ -1998,6 +2022,7 @@
+ 			if (pref == 0) {
+ 				/* No suitable arch in the pref list */
+ 				error = EBADARCH;
++				native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 				goto bad;
+ 			}
+ 
+@@ -2012,12 +2037,14 @@
+ 			}
+ 		}
+ 		error = EBADARCH;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ grade:
+ 	if (!grade_binary(imgp->ip_origcputype, imgp->ip_origcpusubtype & ~CPU_SUBTYPE_MASK,
+ 	    imgp->ip_origcpusubtype & CPU_SUBTYPE_MASK, TRUE)) {
+ 		error = EBADARCH;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 
+@@ -2029,6 +2056,7 @@
+ 		os_log_error(OS_LOG_DEFAULT, "Unsupported 32-bit executable: \"%s\"", (error) ? imgp->ip_vp->v_name : excpath);
+ #endif
+ 		error = EBADARCH;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 
+@@ -2048,6 +2076,7 @@
+ 	/* Copy in arguments/environment from the old process */
+ 	error = exec_extract_strings(imgp);
+ 	if (error) {
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 
+@@ -2098,6 +2127,8 @@
+ 		}
+ 
+ 		exec_failure_reason->osr_flags |= OS_REASON_FLAG_CONSISTENT_FAILURE;
++
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 
+ 		goto badtoolate;
+ 	}
+@@ -2159,6 +2190,7 @@
+ 		/* release new address space since we won't use it */
+ 		imgp->ip_free_map = map;
+ 		map = VM_MAP_NULL;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto badtoolate;
+ 	}
+ 
+@@ -2214,6 +2246,7 @@
+ 		/* release new address space since we won't use it */
+ 		imgp->ip_free_map = map;
+ 		map = VM_MAP_NULL;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto badtoolate;
+ 	}
+ #endif /* __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX) */
+@@ -2342,6 +2375,7 @@
+ 		/* release new address space since we won't use it */
+ 		imgp->ip_free_map = map;
+ 		map = VM_MAP_NULL;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto badtoolate;
+ 	}
+ 
+@@ -2368,6 +2402,7 @@
+ 		/* release new address space since we won't use it */
+ 		imgp->ip_free_map = map;
+ 		map = VM_MAP_NULL;
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto badtoolate;
+ 	}
+ 
+@@ -2406,6 +2441,8 @@
+ 			exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 		}
+ 
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
++
+ 		goto badtoolate;
+ 	}
+ 
+@@ -2435,6 +2472,8 @@
+ 			set_proc_name(imgp, p);
+ 			exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 		}
++
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 
+ 		goto badtoolate;
+ 	}
+@@ -2495,6 +2534,7 @@
+ 			set_proc_name(imgp, p);
+ 			exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 		}
++		native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 		goto badtoolate;
+ 	}
+ 
+@@ -2535,6 +2575,7 @@
+ 				set_proc_name(imgp, p);
+ 				exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 			}
++			native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 			goto badtoolate;
+ 		}
+ 		/* Set the stack */
+@@ -2560,6 +2601,7 @@
+ 				set_proc_name(imgp, p);
+ 				exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 			}
++			native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 			goto badtoolate;
+ 		}
+ 		error = task_set_dyld_info(task, load_result.all_image_info_addr,
+@@ -2576,6 +2618,7 @@
+ 				exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 			}
+ 			error = EINVAL;
++			native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 			goto badtoolate;
+ 		}
+ 	} else {
+@@ -2596,6 +2639,7 @@
+ 				exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 			}
+ 			error = EINVAL;
++			native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 			goto badtoolate;
+ 		}
+ 	}
+@@ -2618,6 +2662,7 @@
+ 				set_proc_name(imgp, p);
+ 				exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 			}
++			native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 			goto badtoolate;
+ 		}
+ 
+@@ -2702,6 +2747,7 @@
+ 		if (error) {
+ 			fp_free(p, load_result.dynlinker_fd, load_result.dynlinker_fp);
+ 			fp_free(p, main_binary_fd, fp);
++			native_gpu_exec_trace(imgp, "mach.failure", error, __LINE__);
+ 			goto badtoolate;
+ 		}
+ 	}
+@@ -2974,11 +3020,13 @@
+ 
+ 	error = execargs_alloc(imgp);
+ 	if (error) {
++		native_gpu_exec_trace(imgp, "activate.failure", error, __LINE__);
+ 		goto bad_notrans;
+ 	}
+ 
+ 	error = exec_save_path(imgp, imgp->ip_user_fname, imgp->ip_seg, &excpath);
+ 	if (error) {
++		native_gpu_exec_trace(imgp, "activate.failure", error, __LINE__);
+ 		goto bad_notrans;
+ 	}
+ 
+@@ -2996,6 +3044,7 @@
+ 		if (error == ERESTART) {
+ 			error = EINTR;
+ 		}
++		native_gpu_exec_trace(imgp, "activate.failure", error, __LINE__);
+ 		goto bad_notrans;
+ 	}
+ 	imgp->ip_ndp = ndp;     /* successful namei(); call nameidone() later */
+@@ -3012,16 +3061,19 @@
+ 	if (p->p_lflag & P_LEXIT) {
+ 		error = EDEADLK;
+ 		proc_unlock(p);
++		native_gpu_exec_trace(imgp, "activate.failure", error, __LINE__);
+ 		goto bad_notrans;
+ 	}
+ 	error = proc_transstart(p, 1, 0);
+ 	proc_unlock(p);
+ 	if (error) {
++		native_gpu_exec_trace(imgp, "activate.failure", error, __LINE__);
+ 		goto bad_notrans;
+ 	}
+ 
+ 	error = exec_check_permissions(imgp);
+ 	if (error) {
++		native_gpu_exec_trace(imgp, "activate.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 
+@@ -3036,6 +3088,7 @@
+ 	    vfs_context_ucred(imgp->ip_vfs_context),
+ 	    &resid, vfs_context_proc(imgp->ip_vfs_context));
+ 	if (error) {
++		native_gpu_exec_trace(imgp, "activate.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 
+@@ -3047,6 +3100,7 @@
+ 	/* Limit the number of iterations we will attempt on each binary */
+ 	if (++itercount > EAI_ITERLIMIT) {
+ 		error = EBADEXEC;
++		native_gpu_exec_trace(imgp, "activate.failure", error, __LINE__);
+ 		goto bad;
+ 	}
+ 	error = -1;
+@@ -5107,7 +5161,9 @@
+ 	 * Warning: If activation failed after point of no return, it returns error
+ 	 * as 0 and pretends the call succeeded.
+ 	 */
++	native_gpu_exec_trace(imgp, "spawn.activate.begin", 0, __LINE__);
+ 	error = exec_activate_image(imgp);
++	native_gpu_exec_trace(imgp, "spawn.activate.end", error, __LINE__);
+ #if defined(HAS_APPLE_PAC)
+ 	const uint8_t disable_user_jop = imgp->ip_flags & IMGPF_NOJOP ? TRUE : FALSE;
+ 	ml_task_set_jop_pid_from_shared_region(new_task, disable_user_jop);
+@@ -5263,6 +5319,7 @@
+ 	}
+ 
+ bad:
++	native_gpu_exec_trace(imgp, "spawn.attributes.result", error, __LINE__);
+ 
+ 	if (error == 0) {
+ 		/* reset delay idle sleep status if set */
+@@ -7451,6 +7508,7 @@
+ 
+ 	/* Only allow execution of regular files */
+ 	if (!vnode_isreg(vp)) {
++		native_gpu_exec_trace(imgp, "permissions.return", EACCES, __LINE__);
+ 		return EACCES;
+ 	}
+ 
+@@ -7464,6 +7522,7 @@
+ 	VATTR_WANTED(vap, va_fileid);
+ 	VATTR_WANTED(vap, va_data_size);
+ 	if ((error = vnode_getattr(vp, vap, imgp->ip_vfs_context)) != 0) {
++		native_gpu_exec_trace(imgp, "permissions.return", error, __LINE__);
+ 		return error;
+ 	}
+ 
+@@ -7473,11 +7532,13 @@
+ 	 * file really is executable.
+ 	 */
+ 	if (!vfs_authopaque(vnode_mount(vp)) && ((vap->va_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0)) {
++		native_gpu_exec_trace(imgp, "permissions.return", EACCES, __LINE__);
+ 		return EACCES;
+ 	}
+ 
+ 	/* Disallow zero length files */
+ 	if (vap->va_data_size == 0) {
++		native_gpu_exec_trace(imgp, "permissions.return", ENOEXEC, __LINE__);
+ 		return ENOEXEC;
+ 	}
+ 
+@@ -7486,6 +7547,7 @@
+ 	imgp->ip_arch_size = vap->va_data_size;
+ #else
+ 	if (vap->va_data_size > UINT32_MAX) {
++		native_gpu_exec_trace(imgp, "permissions.return", ENOEXEC, __LINE__);
+ 		return ENOEXEC;
+ 	}
+ 	imgp->ip_arch_size = (user_size_t)vap->va_data_size;
+@@ -7507,6 +7569,7 @@
+ #if CONFIG_MACF
+ 	error = mac_vnode_check_exec(imgp->ip_vfs_context, vp, imgp);
+ 	if (error) {
++		native_gpu_exec_trace(imgp, "permissions.return", error, __LINE__);
+ 		return error;
+ 	}
+ #endif
+@@ -7518,6 +7581,7 @@
+ 		action |= KAUTH_VNODE_READ_DATA;
+ 	}
+ 	if ((error = vnode_authorize(vp, NULL, action, imgp->ip_vfs_context)) != 0) {
++		native_gpu_exec_trace(imgp, "permissions.return", error, __LINE__);
+ 		return error;
+ 	}
+ 
+@@ -7533,6 +7597,8 @@
+ #endif
+ 
+ 	/* XXX May want to indicate to underlying FS that vnode is open */
++
++	native_gpu_exec_trace(imgp, "permissions.return", error, __LINE__);
+ 
+ 	return error;
+ }
+@@ -9825,6 +9891,7 @@
+ 		signature_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY);
+ 		error = imgp->ip_mac_return;
+ 		unexpected_failure = TRUE;
++		native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 		goto done;
+ 	}
+ 
+@@ -9832,6 +9899,7 @@
+ 		signature_failure_reason = imgp->ip_cs_error;
+ 		imgp->ip_cs_error = OS_REASON_NULL;
+ 		error = EACCES;
++		native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 		goto done;
+ 	}
+ 
+@@ -9839,6 +9907,7 @@
+ 	os_reason_t launch_constraint_reason;
+ 	if ((error = mac_proc_check_launch_constraints(p, imgp, &launch_constraint_reason)) != 0) {
+ 		signature_failure_reason = launch_constraint_reason;
++		native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 		goto done;
+ 	}
+ 
+@@ -9852,6 +9921,7 @@
+ 		    (imgp->ip_subsystem_root_path != NULL)) {
+ 			signature_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY);
+ 			error = EACCES;
++			native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 			goto done;
+ 		}
+ 	}
+@@ -9879,6 +9949,7 @@
+ 				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 				    EXEC_EXIT_REASON_WRONG_PLATFORM);
+ 				error = EACCES;
++				native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 				goto done;
+ 			}
+ 			printf("Allowing spawn of iOS binary %s since it has "
+@@ -9889,6 +9960,7 @@
+ 			signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 			    EXEC_EXIT_REASON_WRONG_PLATFORM);
+ 			error = EACCES;
++			native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 			goto done;
+ 		} else {
+ 			printf("Allowing spawn of iOS binary %s since correct platform was passed in spawn\n",
+@@ -9901,6 +9973,7 @@
+ 	 * taskgated / externally attached path. */
+ 	if (imgp->ip_csflags & CS_SIGNED) {
+ 		error = 0;
++		native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 		goto done;
+ 	}
+ 
+@@ -9917,6 +9990,7 @@
+ 			signature_failure_reason = os_reason_create(OS_REASON_CODESIGNING, CODESIGNING_EXIT_REASON_TASK_ACCESS_PORT);
+ 			error = EACCES;
+ 		}
++		native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 		goto done;
+ 	}
+ 
+@@ -9939,6 +10013,7 @@
+ 		KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXITREASON_CREATE) | DBG_FUNC_NONE,
+ 		    proc_getpid(p), OS_REASON_CODESIGNING, CODESIGNING_EXIT_REASON_TASKGATED_INVALID_SIG, 0, 0);
+ 		signature_failure_reason = os_reason_create(OS_REASON_CODESIGNING, CODESIGNING_EXIT_REASON_TASKGATED_INVALID_SIG);
++		native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 		goto done;
+ 	default:
+ 		error = EACCES;
+@@ -9947,6 +10022,7 @@
+ 		    proc_getpid(p), OS_REASON_EXEC, EXEC_EXIT_REASON_TASKGATED_OTHER, 0, 0);
+ 		signature_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_TASKGATED_OTHER);
+ 		unexpected_failure = TRUE;
++		native_gpu_exec_trace(imgp, "signature.result", error, __LINE__);
+ 		goto done;
+ 	}
+ 

@@ -1,0 +1,306 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3374,47 +3374,109 @@
+ VKAPI_ATTR void VKAPI_CALL
+ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+ {
++   const bool teardown_trace =
++      debug_get_bool_option("TU_DARWIN_DEVICE_FINISH_TRACE", false);
+    VK_FROM_HANDLE(tu_device, device, _device);
+ 
+    if (!device)
+       return;
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH memory_trace\n");
++      fflush(stderr);
++   }
+    tu_memory_trace_finish(device);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH rd_output\n");
++      fflush(stderr);
++   }
+    if (FD_RD_DUMP(ENABLE))
+       fd_rd_output_fini(&device->rd_output);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH breadcrumbs\n");
++      fflush(stderr);
++   }
+    tu_breadcrumbs_finish(device);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH trace_context\n");
++      fflush(stderr);
++   }
+    u_trace_context_fini(&device->trace_context);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH scratch_bos\n");
++      fflush(stderr);
++   }
+    for (unsigned i = 0; i < ARRAY_SIZE(device->scratch_bos); i++) {
+       if (device->scratch_bos[i].initialized)
+          tu_bo_finish(device, device->scratch_bos[i].bo);
+    }
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH private_bos\n");
++      fflush(stderr);
++   }
+    if (device->fiber_pvtmem_bo.bo)
+       tu_bo_finish(device, device->fiber_pvtmem_bo.bo);
+ 
+    if (device->wave_pvtmem_bo.bo)
+       tu_bo_finish(device, device->wave_pvtmem_bo.bo);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH clear_blit\n");
++      fflush(stderr);
++   }
+    tu_destroy_clear_blit_shaders(device);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH empty_shaders\n");
++      fflush(stderr);
++   }
+    tu_destroy_empty_shaders(device);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH dynamic_rendering\n");
++      fflush(stderr);
++   }
+    tu_destroy_dynamic_rendering(device);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH meta\n");
++      fflush(stderr);
++   }
+    vk_meta_device_finish(&device->vk, &device->meta);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH softfloat\n");
++      fflush(stderr);
++   }
+    tu_destroy_softfloat(device);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH compiler\n");
++      fflush(stderr);
++   }
+    ir3_compiler_destroy(device->compiler);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH pipeline_cache\n");
++      fflush(stderr);
++   }
+    vk_pipeline_cache_destroy(device->mem_cache, &device->vk.alloc);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH sub_cs\n");
++      fflush(stderr);
++   }
+    tu_cs_finish(&device->sub_cs);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH perf_and_debug\n");
++      fflush(stderr);
++   }
+    free(device->perfcntrs_pass_cs_entries);
+ 
+    if (device->dbg_cmdbuf_stomp_cs) {
+@@ -3427,17 +3489,49 @@
+       free(device->dbg_renderpass_stomp_cs);
+    }
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH autotune\n");
++      fflush(stderr);
++   }
+    delete device->autotune;
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH perfcntr_state\n");
++      fflush(stderr);
++   }
+    fd_perfcntr_state_free(device->perfcntrs);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH pipeline_suballoc\n");
++      fflush(stderr);
++   }
+    tu_bo_suballocator_finish(&device->pipeline_suballoc);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH kgsl_suballoc\n");
++      fflush(stderr);
++   }
+    tu_bo_suballocator_finish(&device->kgsl_profiling_suballoc);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH event_suballoc\n");
++      fflush(stderr);
++   }
+    tu_bo_suballocator_finish(&device->event_suballoc);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH vis_suballoc\n");
++      fflush(stderr);
++   }
+    tu_bo_suballocator_finish(&device->vis_stream_suballocator);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH global_bo\n");
++      fflush(stderr);
++   }
+    tu_bo_finish(device, device->global_bo);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH optional_bos\n");
++      fflush(stderr);
++   }
+    if (device->vm_bind_fence_fd != -1)
+       close(device->vm_bind_fence_fd);
+ 
+@@ -3447,22 +3541,38 @@
+    if (device->null_accel_struct_bo)
+       tu_bo_finish(device, device->null_accel_struct_bo);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH timestamp_pool\n");
++      fflush(stderr);
++   }
+    list_for_each_entry_safe(struct tu_copy_timestamp_data, data,
+                             &device->copy_timestamp_cs_pool, node)
+    {
+       tu_free_copy_timestamp_data(device, data);
+    }
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH trace_suballoc\n");
++      fflush(stderr);
++   }
+    if (device->trace_suballoc) {
+       tu_bo_suballocator_finish(device->trace_suballoc);
+       vk_free(&device->vk.alloc, device->trace_suballoc);
+    }
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH msrtss\n");
++      fflush(stderr);
++   }
+    if (device->msrtss_color_temporary)
+       tu_destroy_memory(device, device->msrtss_color_temporary);
+    if (device->msrtss_depth_temporary)
+       tu_destroy_memory(device, device->msrtss_depth_temporary);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH queues\n");
++      fflush(stderr);
++   }
+    for (unsigned i = 0; i < TU_MAX_QUEUE_FAMILIES; i++) {
+       for (int q = device->queue_count[i] - 1; q >= 0; q--)
+          tu_queue_finish(&device->queues[i][q]);
+@@ -3470,22 +3580,70 @@
+          vk_free(&device->vk.alloc, device->queues[i]);
+    }
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH backend\n");
++      fflush(stderr);
++   }
+    tu_drm_device_finish(device);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH vma\n");
++      fflush(stderr);
++   }
+    if (device->physical_device->has_set_iova)
+       util_vma_heap_finish(&device->vma);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH bo_map\n");
++      fflush(stderr);
++   }
+    util_sparse_array_finish(&device->bo_map);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH mutexes\n");
++      fflush(stderr);
++   }
+    tu_device_destroy_mutexes(device);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH zombie_vmas\n");
++      fflush(stderr);
++   }
+    u_vector_finish(&device->zombie_vmas);
+ 
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH timeline_cond\n");
++      fflush(stderr);
++   }
+    pthread_cond_destroy(&device->timeline_cond);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH bo_sizes\n");
++      fflush(stderr);
++   }
+    _mesa_hash_table_destroy(device->bo_sizes, NULL);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH submit_bo_list\n");
++      fflush(stderr);
++   }
+    vk_free(&device->vk.alloc, device->submit_bo_list);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH dump_bo_list\n");
++      fflush(stderr);
++   }
+    util_dynarray_fini(&device->dump_bo_list);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH vk_device\n");
++      fflush(stderr);
++   }
+    vk_device_finish(&device->vk);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH device_alloc\n");
++      fflush(stderr);
++   }
+    vk_free(&device->vk.alloc, device);
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH returned\n");
++      fflush(stderr);
++   }
+ }
+ 
+ VkResult
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1538,8 +1538,18 @@
+ static void
+ darwin_device_finish(struct tu_device *dev)
+ {
++   const bool teardown_trace =
++      debug_get_bool_option("TU_DARWIN_DEVICE_FINISH_TRACE", false);
+    /* Closing the connection makes the kernel drain the GPU and free every object this client created. */
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH backend_close\n");
++      fflush(stderr);
++   }
+    dw_close_connection();
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH backend_retire\n");
++      fflush(stderr);
++   }
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    if (retire) {
+       /* Some CreateDevice failure paths already destroyed the VMA heap/mutex.
+@@ -1558,6 +1568,10 @@
+       free(retire->cache);
+       vk_free(&dev->vk.alloc, retire);
+       dev->darwin_retire = NULL;
++   }
++   if (teardown_trace) {
++      fprintf(stderr, "TURNIP_DEVICE_FINISH backend_returned\n");
++      fflush(stderr);
+    }
+ }
+ 

@@ -1,0 +1,367 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -2505,6 +2505,28 @@
+ }
+ 
+ impl crate::Device {
++    /// Retry an unbound allocation once on device-memory exhaustion. The closure must leave
++    /// no placement behind on failure; binding and address reservation happen only afterward.
++    /// Call with no allocator, scratch-cache or recycler lock held.
++    #[track_caller]
++    pub(super) fn retry_memory_allocation<T>(
++        &self,
++        mut allocate: impl FnMut() -> Result<T, Error>,
++    ) -> Result<T, Error> {
++        match allocate() {
++            Err(Error::OutOfMemory(MemoryKind::Device)) => {
++                let blocks = self.trim_cached_memory(Duration::ZERO);
++                let result = allocate();
++                crate::failure_trace::record(format_args!(
++                    "allocation pressure retry freed_blocks={blocks} error={:?}",
++                    result.as_ref().err()
++                ));
++                result
++            }
++            result => result,
++        }
++    }
++
+     /// Keeps no memory for later placements while `on` ([`Memory::held_back`]): the caller turns
+     /// it on as the system reports memory pressure and off as it reports the normal level again.
+     /// Turning it on gives back every spare and kept empty block now: how many blocks went.
+@@ -2539,6 +2561,13 @@
+             ((idle * 10).max(Duration::from_secs(20)), 8)
+         };
+         shared.spares.trim_command_pools(shared, pool_idle, floor);
++        self.trim_cached_memory(idle)
++    }
++
++    /// Reclaim completed resources without taking command-pool/queue locks. Allocation can
++    /// occur while recording commands; their live resources never enter these reuse caches.
++    fn trim_cached_memory(&self, idle: Duration) -> usize {
++        let shared = self.shared();
+         // And the shadows' spare merge scratches unused for five times `idle` (at least 10 s), on
+         // memory pressure all (DroidVM).
+         let scratch_idle = match idle.is_zero() {
+diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -2540,17 +2540,19 @@
+         let shared = self.shared();
+         let raw_device = shared.vk();
+         let requirements = placed(requirements);
+-        let placement = if block_address {
+-            crate::memory::allocate_addressed(
+-                &shared.memory,
+-                raw_device,
+-                &requirements,
+-                class,
+-                &shared.counts,
+-            )?
+-        } else {
+-            crate::memory::allocate(&shared.memory, raw_device, &requirements, class)?
+-        };
++        let placement = self.retry_memory_allocation(|| {
++            if block_address {
++                crate::memory::allocate_addressed(
++                    &shared.memory,
++                    raw_device,
++                    &requirements,
++                    class,
++                    &shared.counts,
++                )
++            } else {
++                crate::memory::allocate(&shared.memory, raw_device, &requirements, class)
++            }
++        })?;
+         // SAFETY: the placement meets the buffer's requirements and is not bound elsewhere.
+         let bound = unsafe {
+             crate::creation::bind_buffer(raw_device, raw, placement.memory, placement.offset)
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2960,15 +2960,16 @@
+             }
+             None => class,
+         };
+-        let placement =
+-            match crate::memory::allocate_image(&shared.memory, raw_device, &requirements, class) {
+-                Ok(placement) => placement,
+-                Err(error) => {
+-                    // SAFETY: the image is unused.
+-                    unsafe { release::object(raw_device, raw) };
+-                    return Err(error);
+-                }
+-            };
++        let placement = match self.retry_memory_allocation(|| {
++            crate::memory::allocate_image(&shared.memory, raw_device, &requirements, class)
++        }) {
++            Ok(placement) => placement,
++            Err(error) => {
++                // SAFETY: the image is unused.
++                unsafe { release::object(raw_device, raw) };
++                return Err(error);
++            }
++        };
+         // SAFETY: the placement meets the image's requirements and is not bound elsewhere.
+         if let Err(error) = unsafe {
+             crate::creation::bind_image(raw_device, raw, placement.memory, placement.offset)
+diff --git a/crates/metal2vulkan-runtime/src/creation.rs b/crates/metal2vulkan-runtime/src/creation.rs
+--- a/crates/metal2vulkan-runtime/src/creation.rs
++++ b/crates/metal2vulkan-runtime/src/creation.rs
+@@ -110,6 +110,8 @@
+ ) -> VkResult<vk::DeviceMemory> {
+     vk_made(VkMaking::Memory, Location::caller());
+     note_allocation_site(info.allocation_size);
++    #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
++    crate::tests::allocation_pressure::check(device, info.allocation_size)?;
+     // SAFETY: the caller's.
+     unsafe { device.allocate_memory(info, None) }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/tests/mod.rs b/crates/metal2vulkan-runtime/src/tests/mod.rs
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -315,3 +315,6 @@
+ 
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod recycle_pressure;
++
++#[cfg(any(m2v_gpu, m2v_cpu_icd))]
++pub(crate) mod allocation_pressure;
+diff --git a/crates/metal2vulkan-runtime/src/tests/allocation_pressure.rs b/crates/metal2vulkan-runtime/src/tests/allocation_pressure.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/allocation_pressure.rs
+@@ -0,0 +1,231 @@
++//! Capacity pressure at the Vulkan allocation boundary, with real buffers/images and GPU copies.
++use crate::{
++    CommandBufferStatus, Device, DeviceKind, DeviceOptions, Error, HazardTrackingMode,
++    ResourceOptions, TextureDescriptor,
++};
++use ash::vk;
++use metal2vulkan::metal::{PixelFormat, TextureUsage};
++use std::{cell::RefCell, time::Duration};
++
++static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
++struct Pressure {
++    device: Device,
++    budget: u64,
++    forced: Option<vk::Result>,
++    attempts: usize,
++    refused: usize,
++}
++thread_local! { static PRESSURE: RefCell<Option<Pressure>> = const { RefCell::new(None) }; }
++
++fn resident(device: &Device) -> u64 {
++    let census = device.shared().memory.lock().unwrap().census();
++    census.pooled_bytes + census.empty_bytes + census.dedicated_bytes + census.imported_bytes
++}
++
++// Only this test thread/device is constrained. Successful calls still reach the real ICD.
++// memory::place invokes vkAllocateMemory with the allocator lock released.
++pub(crate) fn check(raw: &ash::Device, bytes: u64) -> Result<(), vk::Result> {
++    PRESSURE.with(|cell| {
++        let mut state = cell.borrow_mut();
++        let Some(pressure) = state.as_mut() else {
++            return Ok(());
++        };
++        if pressure.device.shared().vk().handle() != raw.handle() {
++            return Ok(());
++        }
++        pressure.attempts += 1;
++        let error = pressure.forced.or_else(|| {
++            (resident(&pressure.device).saturating_add(bytes) > pressure.budget)
++                .then_some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
++        });
++        match error {
++            Some(error) => {
++                pressure.refused += 1;
++                Err(error)
++            }
++            None => Ok(()),
++        }
++    })
++}
++
++struct Limit;
++impl Limit {
++    fn new(device: &Device, budget: u64, forced: Option<vk::Result>) -> Self {
++        PRESSURE.with(|cell| {
++            assert!(cell.borrow().is_none());
++            *cell.borrow_mut() = Some(Pressure {
++                device: device.clone(),
++                budget,
++                forced,
++                attempts: 0,
++                refused: 0,
++            });
++        });
++        Limit
++    }
++    fn counts(&self) -> (usize, usize) {
++        PRESSURE.with(|cell| {
++            let state = cell.borrow();
++            let p = state.as_ref().unwrap();
++            (p.attempts, p.refused)
++        })
++    }
++}
++impl Drop for Limit {
++    fn drop(&mut self) {
++        PRESSURE.with(|cell| *cell.borrow_mut() = None);
++    }
++}
++
++fn device() -> Device {
++    let device = Device::system_default_with(&DeviceOptions {
++        kinds: if cfg!(m2v_cpu_icd) {
++            vec![DeviceKind::Cpu]
++        } else {
++            vec![
++                DeviceKind::Discrete,
++                DeviceKind::Integrated,
++                DeviceKind::Virtual,
++            ]
++        },
++        ..DeviceOptions::default()
++    })
++    .unwrap();
++    device.hold_back_memory(true); // No speculative allocator thread during the pressure window.
++    device.trim_kept_memory(Duration::ZERO);
++    device
++}
++
++fn descriptor(width: u32, height: u32) -> TextureDescriptor {
++    let mut desc =
++        TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, width.into(), height.into(), false);
++    desc.resource_options = ResourceOptions::private();
++    desc.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
++    desc
++}
++
++#[test]
++fn buffer_allocation_reclaims_parked_resources_without_explicit_trim() {
++    let _serial = SERIAL
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let device = device();
++    let baseline = resident(&device);
++    drop(
++        device
++            .unzeroed_buffer(1 << 20, HazardTrackingMode::Default)
++            .unwrap(),
++    );
++    assert!(resident(&device) > baseline);
++    let limit = Limit::new(&device, baseline + (12 << 20), None);
++    let allocated = device
++        .unzeroed_buffer(12 << 20, HazardTrackingMode::Default)
++        .expect("reclaim the parked buffer on OOM and retry the real allocation");
++    assert!(limit.counts().1 > 0, "the capacity refusal must execute");
++    assert!(device.work_counts().object_churn.buffers_evicted > 0);
++    drop(limit);
++    drop(allocated);
++}
++
++#[test]
++fn image_allocation_reclaims_parked_resources_without_explicit_trim() {
++    let _serial = SERIAL
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let device = device();
++    let baseline = resident(&device);
++    drop(device.new_texture(&descriptor(256, 256)).unwrap());
++    assert!(resident(&device) > baseline);
++    let limit = Limit::new(&device, baseline + (8 << 20), None);
++    let allocated = device
++        .new_texture(&descriptor(1024, 2048))
++        .expect("reclaim the parked image on OOM and retry the real allocation");
++    assert!(limit.counts().1 > 0);
++    assert!(device.work_counts().object_churn.images_evicted > 0);
++    drop(limit);
++    drop(allocated);
++}
++
++#[test]
++fn allocation_pressure_preserves_unsubmitted_command_copy() {
++    let _serial = SERIAL
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let device = device();
++    let queue = device.new_command_queue().unwrap();
++    let input = device
++        .unzeroed_buffer(4096, HazardTrackingMode::Default)
++        .unwrap();
++    let output = device.new_buffer(4096, ResourceOptions::shared()).unwrap();
++    let command = queue.command_buffer().unwrap();
++    let mut blit = command.blit_command_encoder().unwrap();
++    blit.fill_buffer(&input, 0..4096, 0xa7).unwrap();
++    blit.copy_from_buffer_to_buffer(&input, 0, &output, 0, 4096)
++        .unwrap();
++    blit.end_encoding().unwrap();
++    drop(input);
++    let before_cached = resident(&device);
++    drop(
++        device
++            .unzeroed_buffer(40 << 20, HazardTrackingMode::Default)
++            .unwrap(),
++    );
++    let limit = Limit::new(&device, before_cached + (12 << 20), None);
++    let new = device
++        .unzeroed_buffer(12 << 20, HazardTrackingMode::Default)
++        .unwrap();
++    assert!(limit.counts().1 > 0);
++    drop(limit);
++    command.commit().unwrap();
++    command
++        .wait_until_completed_for(Duration::from_secs(30))
++        .unwrap();
++    assert_eq!(command.status(), CommandBufferStatus::Completed);
++    // SAFETY: the copy completed and output remains live through the read.
++    let bytes = unsafe { std::slice::from_raw_parts(output.contents().unwrap().as_ptr(), 4096) };
++    assert!(bytes.iter().all(|&byte| byte == 0xa7));
++    drop(new);
++}
++
++#[test]
++fn real_exhaustion_returns_error_preserving_live_allocations() {
++    let _serial = SERIAL
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let device = device();
++    let live = device
++        .unzeroed_buffer(12 << 20, HazardTrackingMode::Default)
++        .unwrap();
++    let baseline = resident(&device);
++    let limit = Limit::new(&device, baseline, None);
++    assert!(matches!(
++        device.unzeroed_buffer(12 << 20, HazardTrackingMode::Default),
++        Err(Error::OutOfMemory(_))
++    ));
++    assert!(limit.counts().0 <= 16, "failure must be bounded");
++    assert_eq!(resident(&device), baseline);
++    drop(limit);
++    drop(live);
++}
++
++#[test]
++fn device_lost_is_not_retried_or_disguised_as_memory_pressure() {
++    let _serial = SERIAL
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    let device = device();
++    drop(
++        device
++            .unzeroed_buffer(1 << 20, HazardTrackingMode::Default)
++            .unwrap(),
++    );
++    let before = resident(&device);
++    let limit = Limit::new(&device, u64::MAX, Some(vk::Result::ERROR_DEVICE_LOST));
++    assert!(matches!(
++        device.unzeroed_buffer(12 << 20, HazardTrackingMode::Default),
++        Err(Error::DeviceLost)
++    ));
++    assert_eq!(limit.counts(), (1, 1));
++    assert_eq!(resident(&device), before);
++    assert_eq!(device.work_counts().object_churn.buffers_evicted, 0);
++}

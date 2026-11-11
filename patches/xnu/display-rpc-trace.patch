@@ -1,0 +1,101 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -113,6 +113,63 @@
+ 
+ #include <sys/kdebug.h>
+ #include <sys/proc_ro.h>
++#include <pexpert/pexpert.h>
++#include <os/atomic_private.h>
++/* Match osfmk/kern/kmod.c and task.c: avoid BSD type collisions. */
++extern void proc_selfname(char *buf, int size);
++extern int proc_selfpid(void);
++
++
++/* Opt-in serial observation of the pinned QuartzCore display RPC. No policy changes. */
++static bool
++droidvm_display_rpc_id(uint32_t msgid)
++{
++	return msgid == 0x9d27 || msgid == 0x9d8b;
++}
++
++static void
++droidvm_display_rpc_trace(const char *event, uint32_t msgid,
++    mach_msg_return_t result, mach_msg_size_t size, mach_port_name_t port,
++    mach_msg_option64_t options, mach_vm_address_t user_message)
++{
++	static uint32_t rpc_count, error_count;
++	uint32_t *budget;
++	uint32_t count;
++	uint32_t words[9] = {0};
++	char name[32] = {0};
++	int enabled = 0, copied = -1, mig_valid = 0;
++	bool selected = droidvm_display_rpc_id(msgid);
++	if (!selected && result == MACH_MSG_SUCCESS) {
++		return;
++	}
++	PE_parse_boot_argn("droidvm-display-rpc", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	proc_selfname(name, sizeof(name));
++	if (!selected && strcmp(name, "chronod") && strcmp(name, "backboardd") &&
++	    strcmp(name, "SpringBoard")) {
++		return;
++	}
++	budget = selected ? &rpc_count : &error_count;
++	count = os_atomic_load(budget, relaxed);
++	do {
++		if (count >= (selected ? 128u : 64u)) {
++			return;
++		}
++	} while (!os_atomic_cmpxchgv(budget, count, count + 1, &count, relaxed));
++	/* MIG error replies have header + NDR + RetCode; complex replies differ. */
++	if (user_message && msgid == 0x9d8b && size >= sizeof(words)) {
++		copied = copyin(user_message, words, sizeof(words));
++		mig_valid = copied == 0 && !(words[0] & MACH_MSGH_BITS_COMPLEX) &&
++		    words[5] == msgid;
++	}
++	kprintf("droidvm-display-rpc: %s %s[%d] tid=%llu id=0x%x result=0x%x "
++	    "size=%u port=0x%x options=0x%llx copy=%d mig_valid=%d mig_rc=0x%x\n",
++	    event, name, proc_selfpid(), (unsigned long long)thread_tid(current_thread()),
++	    msgid, result, size, port, (unsigned long long)options, copied,
++	    mig_valid, mig_valid ? words[8] : 0);
++}
+ 
+ #ifndef offsetof
+ #define offsetof(type, member)  ((size_t)(&((type *)0)->member))
+@@ -292,6 +349,8 @@
+ 	mach_msg_return_t       mr      = self->ith_state;
+ 	mach_msg_option64_t     options = self->ith_option;
+ 	ipc_kmsg_t              kmsg    = self->ith_kmsg;
++	uint32_t droidvm_rpc_id = mr == MACH_MSG_SUCCESS ?
++	    (uint32_t)ikm_header(kmsg)->msgh_id : 0;
+ 
+ 	mach_msg_recv_bufs_t recv_bufs = self->ith_recv_bufs;
+ 	mach_msg_recv_result_t msgr = {
+@@ -378,6 +437,8 @@
+ 	/* kmsg freed */
+ 
+ out:
++	droidvm_display_rpc_trace("receive", droidvm_rpc_id, mr,
++	    msgr.msgr_msg_size, 0, options, 0);
+ 	if (msgr_out) {
+ 		*msgr_out = msgr;
+ 	}
+@@ -1000,7 +1061,16 @@
+ 			send_uctx.send_msg_size = (mach_msg_size_t)(mb_ss >> 32);
+ 		}
+ 
++		if (droidvm_display_rpc_id((uint32_t)(mv_id >> 32))) {
++			droidvm_display_rpc_trace("send", (uint32_t)(mv_id >> 32), 0,
++			    send_uctx.send_msg_size, (mach_port_name_t)mr_lp, option64,
++			    send_uctx.send_msg_addr);
++		}
+ 		mr = mach_msg_trap_send(&send_uctx, option64, msg_timeout, priority);
++		if (droidvm_display_rpc_id((uint32_t)(mv_id >> 32))) {
++			droidvm_display_rpc_trace("sent", (uint32_t)(mv_id >> 32), mr,
++			    send_uctx.send_msg_size, (mach_port_name_t)mr_lp, option64, 0);
++		}
+ 	}
+ 
+ send_fail:

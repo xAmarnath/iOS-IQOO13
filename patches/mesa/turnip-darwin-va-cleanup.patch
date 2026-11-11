@@ -1,0 +1,14 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1561,8 +1561,9 @@
+       if (retire->cache_stats.lookups)
+          darwin_cache_log(retire);
+       darwin_stats_state = NULL;
++      /* Unlink both indexes before freeing: next() walks parent pointers. */
+       rb_tree_foreach_safe(struct darwin_va_hole, hole, &retire->va.address, by_address)
+-         free(hole);
++         darwin_va_del(&retire->va, hole);
+       pthread_mutex_destroy(&retire->lock);
+       free(retire->entries);
+       free(retire->cache);

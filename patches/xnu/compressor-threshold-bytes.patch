@@ -1,0 +1,52 @@
+Complete the board's droidvm-free-target-bytes conversion for XNU 12377.
+Keep the same byte-rate and reserved-byte thresholds on non-Apple ARM64
+with 4 KiB pages. Apple and macOS configurations retain their defaults.
+
+--- a/osfmk/vm/vm_compressor_xnu.h
++++ b/osfmk/vm/vm_compressor_xnu.h
+@@ -440,7 +440,17 @@
+ 
+ 
++/* The board already scales pageout targets. Scale compressor reserves and
++ * page-count thrashing detectors too, preserving their 16 KiB byte budgets.
++ * ARM_PGBYTES is constant so it also works in global initializers. */
++#if !XNU_TARGET_OS_OSX && defined(__arm64__) && !defined(APPLE_ARM64_ARCH_FAMILY)
++#define DROIDVM_COMPRESSOR_PAGE_SCALE ((16384 / ARM_PGBYTES) ? (16384 / ARM_PGBYTES) : 1)
++#else
++#define DROIDVM_COMPRESSOR_PAGE_SCALE 1
++#endif
++#define DROIDVM_COMPRESSOR_PAGES(pages) ((pages) * DROIDVM_COMPRESSOR_PAGE_SCALE)
++
+ #if !XNU_TARGET_OS_OSX
+-#define COMPRESSOR_FREE_RESERVED_LIMIT          28
++#define COMPRESSOR_FREE_RESERVED_LIMIT          DROIDVM_COMPRESSOR_PAGES(28)
+ #else /* !XNU_TARGET_OS_OSX */
+ #define COMPRESSOR_FREE_RESERVED_LIMIT          128
+ #endif /* !XNU_TARGET_OS_OSX */
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -2654,8 +2654,8 @@
+ uint32_t compressor_eval_period_in_msecs = 250;
+ uint32_t compressor_sample_min_in_msecs = 500;
+ uint32_t compressor_sample_max_in_msecs = 10000;
+-uint32_t compressor_thrashing_threshold_per_10msecs = 50;
+-uint32_t compressor_thrashing_min_per_10msecs = 20;
++uint32_t compressor_thrashing_threshold_per_10msecs = DROIDVM_COMPRESSOR_PAGES(50);
++uint32_t compressor_thrashing_min_per_10msecs = DROIDVM_COMPRESSOR_PAGES(20);
+ 
+ /* When true, reset sample data next chance we get. */
+ static boolean_t        compressor_need_sample_reset = FALSE;
+--- a/osfmk/vm/vm_phantom_cache.c
++++ b/osfmk/vm/vm_phantom_cache.c
+@@ -36,9 +36,9 @@
+ 
+ 
+ uint32_t phantom_cache_eval_period_in_msecs = 250;
+-uint32_t phantom_cache_thrashing_threshold_ssd = 1000;
++uint32_t phantom_cache_thrashing_threshold_ssd = DROIDVM_COMPRESSOR_PAGES(1000);
+ #if !XNU_TARGET_OS_OSX
+-uint32_t phantom_cache_thrashing_threshold = 500;
++uint32_t phantom_cache_thrashing_threshold = DROIDVM_COMPRESSOR_PAGES(500);
+ #else /* !XNU_TARGET_OS_OSX */
+ uint32_t phantom_cache_thrashing_threshold = 50;
+ #endif /* !XNU_TARGET_OS_OSX */

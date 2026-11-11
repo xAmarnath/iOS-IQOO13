@@ -1,0 +1,177 @@
+Opt-in bounded native display-client method/trap/notification tracing.
+Preserves original dispatch, locking, return codes and authenticated vtables.
+
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -68,6 +68,8 @@
+ #endif /* CONFIG_MACF */
+ 
+ #include <IOKit/assert.h>
++#include <pexpert/pexpert.h>
++#include <kern/thread.h>
+ 
+ #include "IOServicePrivate.h"
+ #include "IOKitKernelInternal.h"
+@@ -4771,6 +4773,102 @@
+ 	return theService ? kIOReturnSuccess : kIOReturnUnsupported;
+ }
+ 
++
++/* BEGIN DROIDVM_DISPLAY_CALL_TRACE */
++static int
++droidvm_display_call_family(IOUserClient *client)
++{
++	if (!client) {
++		return -1;
++	}
++	const char *name = client->getMetaClass()->getClassName();
++	if (!name) {
++		return -1;
++	}
++	if (!strcmp(name, "IOSurfaceRootUserClient")) {
++		return 1;
++	}
++	return (!strncmp(name, "IOMobileFramebuffer", 19) || !strncmp(name, "IOMFB", 5)) ? 0 : -1;
++}
++
++static bool
++droidvm_display_call_selected(IOUserClient *client)
++{
++	unsigned enabled = 0;
++	PE_parse_boot_argn("droidvm-display-rpc", &enabled, sizeof(enabled));
++	if (enabled != 1 || !client) {
++		return false;
++	}
++	return droidvm_display_call_family(client) >= 0;
++}
++
++static unsigned
++droidvm_display_call_budget(IOUserClient *client, unsigned kind, uint32_t selector, bool failure)
++{
++	/* Two entry/return pairs and one later failure per selector. Unknown
++	 * selectors share one bucket. Separate IOSurface/IOMFB budgets avoid
++	 * one client's startup hiding the other. At most 1310 lines per boot. */
++	static unsigned calls[2][3][97], failures[2][3][97];
++	const int family = droidvm_display_call_family(client);
++	if (family < 0 || kind > 2) {
++		return 0;
++	}
++	const unsigned last = kind == 0 ? 96 : 16;
++	const unsigned slot = selector < last ? selector : last;
++	unsigned *value = failure ? &failures[family][kind][slot] : &calls[family][kind][slot];
++	unsigned seen = __atomic_load_n(value, __ATOMIC_RELAXED);
++	do {
++		if (seen >= (failure ? 1u : 2u)) {
++			return 0;
++		}
++	} while (!__atomic_compare_exchange_n(value, &seen, seen + 1, false,
++	    __ATOMIC_RELAXED, __ATOMIC_RELAXED));
++	return seen + 1;
++}
++
++static void
++droidvm_display_call_emit(IOUserClient *client, unsigned kind, uint32_t selector,
++    const IOExternalMethodArguments *args, unsigned ticket, const char *stage, IOReturn result)
++{
++	kprintf("droidvm-display-call: %s kind=%u class=%s pid=%d tid=%llu selector=%u n=%u "
++	    "result=0x%x scalars=%u/%u bytes=%u/%u descriptors=%u/%u\n",
++	    stage, kind, client->getMetaClass()->getClassName(), proc_selfpid(),
++	    (unsigned long long)thread_tid(current_thread()), selector, ticket, (unsigned)result,
++	    args ? args->scalarInputCount : 0, args ? args->scalarOutputCount : 0,
++	    args ? args->structureInputSize : 0, args ? args->structureOutputSize : 0,
++	    args && args->structureInputDescriptor ? 1u : 0u,
++	    args && args->structureOutputDescriptor ? 1u : 0u);
++}
++
++static unsigned
++droidvm_display_call_begin(IOUserClient *client, unsigned kind, uint32_t selector,
++    const IOExternalMethodArguments *args)
++{
++	if (!droidvm_display_call_selected(client)) {
++		return 0;
++	}
++	unsigned ticket = droidvm_display_call_budget(client, kind, selector, false);
++	if (ticket) {
++		droidvm_display_call_emit(client, kind, selector, args, ticket, "begin", 0);
++	}
++	return ticket;
++}
++
++static void
++droidvm_display_call_end(IOUserClient *client, unsigned kind, uint32_t selector,
++    const IOExternalMethodArguments *args, unsigned ticket, IOReturn result)
++{
++	if (ticket) {
++		droidvm_display_call_emit(client, kind, selector, args, ticket, "end", result);
++	} else if (result != kIOReturnSuccess && droidvm_display_call_selected(client)) {
++		ticket = droidvm_display_call_budget(client, kind, selector, true);
++		if (ticket) {
++			droidvm_display_call_emit(client, kind, selector, args, ticket, "failure", result);
++		}
++	}
++}
++/* END DROIDVM_DISPLAY_CALL_TRACE */
++
+ /* Routine io_connect_set_notification_port */
+ kern_return_t
+ is_io_connect_set_notification_port(
+@@ -4784,11 +4882,13 @@
+ 
+ 	IOStatisticsClientCall();
+ 
++	unsigned displayTrace = droidvm_display_call_begin(client, 2, notification_type, NULL);
+ 	client->ipcEnter(kIPCLockWrite);
+ 	ret = client->registerNotificationPort( port, notification_type,
+ 	    (io_user_reference_t) reference );
+ 	client->ipcExit(kIPCLockWrite);
+ 
++	droidvm_display_call_end(client, 2, notification_type, NULL, displayTrace, ret);
+ 	return ret;
+ }
+ 
+@@ -4805,11 +4905,13 @@
+ 
+ 	IOStatisticsClientCall();
+ 
++	unsigned displayTrace = droidvm_display_call_begin(client, 2, notification_type, NULL);
+ 	client->ipcEnter(kIPCLockWrite);
+ 	ret = client->registerNotificationPort( port, notification_type,
+ 	    reference );
+ 	client->ipcExit(kIPCLockWrite);
+ 
++	droidvm_display_call_end(client, 2, notification_type, NULL, displayTrace, ret);
+ 	return ret;
+ }
+ 
+@@ -6634,6 +6736,7 @@
+ 		if ((userClient = OSDynamicCast(IOUserClient, ref_current_task))) {
+ 			IOExternalTrap *trap = NULL;
+ 			IOService *target = NULL;
++			unsigned displayTrace = droidvm_display_call_begin(userClient, 1, args->index, NULL);
+ 
+ 			result = kIOReturnSuccess;
+ 			io_filter_policy_t filterPolicy = userClient->filterForTask(current_task(), 0);
+@@ -6656,6 +6759,7 @@
+ 				}
+ 			}
+ 
++			droidvm_display_call_end(userClient, 1, args->index, NULL, displayTrace, result);
+ 			iokit_remove_connect_reference(userClient);
+ 		} else {
+ 			OSSafeReleaseNULL(ref_current_task);
+@@ -6706,6 +6810,7 @@
+ IOUserClient::callExternalMethod(uint32_t selector, IOExternalMethodArguments * args)
+ {
+ 	IOReturn ret;
++	unsigned displayTrace = droidvm_display_call_begin(this, 0, selector, args);
+ 
+ 	ipcEnter(defaultLocking ? (defaultLockingSingleThreadExternalMethod ? kIPCLockWrite : kIPCLockRead) : kIPCLockNone);
+ 	if (uc2022) {
+@@ -6715,6 +6820,7 @@
+ 	}
+ 	ipcExit(defaultLocking ? (defaultLockingSingleThreadExternalMethod ? kIPCLockWrite : kIPCLockRead) : kIPCLockNone);
+ 
++	droidvm_display_call_end(this, 0, selector, args, displayTrace, ret);
+ 	return ret;
+ }
+ 
